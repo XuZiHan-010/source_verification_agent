@@ -8,5 +8,9 @@ RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
+# Set environment for production deployment
+ENV PROJECT_ROOT=/app
+ENV PORT=8000
+
 # Run both API and Worker in the same container
 CMD ["bash", "-c", "python -m market_source_verification_agent.server & python -m market_source_verification_agent.worker; wait"]

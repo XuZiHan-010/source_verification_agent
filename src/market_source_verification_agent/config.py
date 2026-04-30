@@ -10,7 +10,8 @@ import yaml
 from pydantic import BaseModel, Field
 
 
-ROOT = Path(__file__).resolve().parents[2]
+# In production (installed via pip), override with PROJECT_ROOT env var to point to /app
+ROOT = Path(os.getenv("PROJECT_ROOT", Path(__file__).resolve().parents[2]))
 
 
 class ModelSettings(BaseModel):
