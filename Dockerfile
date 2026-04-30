@@ -2,14 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY pyproject.toml pyproject.toml
-COPY src/ src/
-COPY config/ config/
-COPY web/ web/
-COPY start.sh start.sh
+COPY . .
 
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
-CMD ["bash", "start.sh"]
+# Run both API and Worker in the same container
+CMD ["bash", "-c", "python -m market_source_verification_agent.server & python -m market_source_verification_agent.worker; wait"]
