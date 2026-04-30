@@ -90,6 +90,21 @@
   .nav .meta .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); display: inline-block; box-shadow: 0 0 8px var(--ok); animation: pulse 2.4s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 
+  .nav .auth-section {
+    display: flex; align-items: center; gap: 12px; margin-left: 24px; padding-left: 24px;
+    border-left: 1px solid var(--border);
+  }
+  .nav .auth-section label {
+    font-family: var(--mono); font-size: 11px; color: var(--text-3); letter-spacing: .08em;
+  }
+  .nav .auth-section input {
+    background: var(--surface); border: 1px solid var(--border-2); color: var(--text);
+    font-family: var(--mono); font-size: 12px; padding: 6px 10px; border-radius: 3px;
+    width: 200px; outline: none; transition: border-color .2s;
+  }
+  .nav .auth-section input:focus { border-color: var(--tier-a); }
+  .nav .auth-section input::placeholder { color: var(--text-4); }
+
   /* ─────────── layout ─────────── */
   main { max-width: 1320px; margin: 0 auto; padding: 56px 32px 96px; position: relative; z-index: 2; }
 
@@ -440,6 +455,10 @@
     <span>RUN · 0xA31F</span>
     <span>2026-04-29 · UTC+8</span>
   </div>
+  <div class="auth-section">
+    <label for="apiKeyInput">API Key</label>
+    <input type="password" id="apiKeyInput" placeholder="输入 API Key..." />
+  </div>
 </nav>
 
 <main>
@@ -737,6 +756,38 @@ function closeDrawer() {
   document.getElementById("mask").classList.remove("open");
 }
 
+function getApiKey() {
+  const input = document.getElementById("apiKeyInput");
+  const stored = localStorage.getItem("apiKey");
+  const current = input.value.trim();
+  if (current) {
+    localStorage.setItem("apiKey", current);
+    return current;
+  }
+  return stored || "";
+}
+
+function buildHeaders() {
+  const headers = {};
+  const apiKey = getApiKey();
+  if (apiKey) {
+    headers["X-API-Key"] = apiKey;
+  }
+  return headers;
+}
+
+async function fetchWithAuth(url, options = {}) {
+  const headers = { ...buildHeaders(), ...(options.headers || {}) };
+  const response = await fetch(url, { ...options, headers });
+  if (response.status === 401) {
+    alert("API Key 错误或已过期，请重新输入。");
+    document.getElementById("apiKeyInput").value = "";
+    localStorage.removeItem("apiKey");
+    throw new Error("Unauthorized");
+  }
+  return response;
+}
+
 function setSummary(summary = {}) {
   const total = summary.total || currentRows.length || 0;
   const supported = summary.supported || 0;
@@ -851,7 +902,7 @@ async function submitRun() {
   updatePipeline("ingest", "running");
 
   try {
-    const response = await fetch(`${API_BASE}/api/runs`, { method: "POST", body: form });
+    const response = await fetchWithAuth(`${API_BASE}/api/runs`, { method: "POST", body: form });
     if (!response.ok) throw new Error(await response.text());
     currentRun = await response.json();
     setRunMeta(currentRun);
@@ -866,7 +917,7 @@ async function submitRun() {
 
 async function pollRun(runId) {
   while (true) {
-    const response = await fetch(`${API_BASE}/api/runs/${runId}`);
+    const response = await fetchWithAuth(`${API_BASE}/api/runs/${runId}`);
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
     currentRun = payload.run;
@@ -884,7 +935,7 @@ async function pollRun(runId) {
 }
 
 async function loadResult(runId) {
-  const response = await fetch(`${API_BASE}/api/runs/${runId}/result`);
+  const response = await fetchWithAuth(`${API_BASE}/api/runs/${runId}/result`);
   if (!response.ok) throw new Error(await response.text());
   const payload = await response.json();
   currentRows = payload.map(normalizeRow);
@@ -899,12 +950,24 @@ function bindDownloads(runId) {
     const label = button.textContent.trim().replace("↓ ", "").toLowerCase();
     button.disabled = label !== "json";
     button.title = label === "json" ? "下载当前结构化结果" : "当前前端结果视图默认生成 JSON；其他格式可通过 CLI 或后端扩展生成";
-    button.onclick = () => {
+    button.onclick = async () => {
       if (label !== "json") {
         alert("当前页面默认生成 JSON 结果；XLSX / MD / HTML 下载入口可以下一步再补成按需导出。");
         return;
       }
-      window.location.href = `${API_BASE}/api/runs/${runId}/download?fmt=json`;
+      try {
+        const response = await fetchWithAuth(`${API_BASE}/api/runs/${runId}/download?fmt=json`);
+        if (!response.ok) throw new Error("下载失败");
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `verification-${runId}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (error) {
+        alert(`下载失败：${error.message}`);
+      }
     };
   });
 }
@@ -956,6 +1019,11 @@ renderTable();
 setSummary({});
 setRunMeta(null);
 updatePipeline("queued", "queued");
+
+const storedApiKey = localStorage.getItem("apiKey");
+if (storedApiKey) {
+  document.getElementById("apiKeyInput").value = storedApiKey;
+}
 </script>
 
 </body>
