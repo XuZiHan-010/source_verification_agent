@@ -104,6 +104,14 @@ def create_app():
             background_tasks.add_task(execute_run, task.run_id, owner_id, store)
         return task
 
+    @app.get("/api/runs")
+    def list_runs(
+        owner_id: Annotated[str, Depends(current_owner)],
+        limit: int = 20,
+        offset: int = 0,
+    ):
+        return store.list_runs(owner_id, limit=limit, offset=offset)
+
     @app.get("/api/runs/{run_id}")
     def get_run(run_id: str, owner_id: Annotated[str, Depends(current_owner)]):
         task = store.get_task(run_id, owner_id)

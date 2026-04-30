@@ -441,6 +441,104 @@
   }
   .ornament .v { color: var(--flag); }
 
+  /* ─────────── history button ─────────── */
+  .nav-hist-btn {
+    appearance: none; border: 1px solid var(--border); background: transparent;
+    color: var(--text-3); cursor: pointer;
+    font-family: var(--mono); font-size: 11px; letter-spacing: .12em;
+    padding: 5px 12px; border-radius: 2px; transition: color .15s, border-color .15s;
+  }
+  .nav-hist-btn:hover { color: var(--text); border-color: var(--border-2); }
+
+  /* ─────────── history panel (slides from left) ─────────── */
+  .hist-mask {
+    position: fixed; inset: 0; background: rgba(0,0,0,.65); backdrop-filter: blur(4px);
+    z-index: 60; opacity: 0; pointer-events: none; transition: opacity .25s;
+  }
+  .hist-mask.open { opacity: 1; pointer-events: auto; }
+  .hist-panel {
+    position: fixed; top: 0; left: 0; bottom: 0; width: min(640px, 100%);
+    background: var(--surface); border-right: 1px solid var(--border);
+    transform: translateX(-100%); transition: transform .35s cubic-bezier(.2,.8,.2,1);
+    z-index: 61; overflow-y: auto;
+    box-shadow: 40px 0 80px -20px rgba(0,0,0,.7);
+    display: flex; flex-direction: column;
+  }
+  .hist-panel.open { transform: translateX(0); }
+  .hist-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 28px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: var(--surface); z-index: 2;
+    flex-shrink: 0;
+  }
+  .hist-head h3 {
+    font-family: var(--display); font-style: italic; font-weight: 400;
+    font-size: 22px; letter-spacing: -.01em;
+  }
+  .hist-head .meta { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); letter-spacing: .12em; }
+  .hist-head .x { background: transparent; border: 0; color: var(--text-2); font-size: 22px; cursor: pointer; line-height: 1; }
+
+  .hist-body { padding: 20px 28px; flex: 1; }
+
+  .hist-run {
+    border: 1px solid var(--border); border-radius: 3px;
+    margin-bottom: 12px; overflow: hidden;
+    background: var(--bg-grain); transition: border-color .15s;
+  }
+  .hist-run:hover { border-color: var(--border-2); }
+
+  .hist-run-head {
+    padding: 14px 18px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    cursor: pointer;
+  }
+  .hist-run-head .run-id {
+    font-family: var(--mono); font-size: 11px; color: var(--text-3); letter-spacing: .1em;
+    flex-shrink: 0;
+  }
+  .hist-run-head .run-file {
+    font-size: 13.5px; color: var(--text); flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .hist-run-head .run-time {
+    font-family: var(--mono); font-size: 10.5px; color: var(--text-3); flex-shrink: 0;
+  }
+
+  .hist-run-foot {
+    padding: 10px 18px; border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .hist-status {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+    padding: 3px 8px; border-radius: 2px; border: 1px solid;
+  }
+  .hist-status.completed { color: var(--ok); border-color: var(--ok); background: rgba(52,211,153,.08); }
+  .hist-status.running, .hist-status.queued { color: var(--warn); border-color: var(--warn); background: rgba(251,191,36,.08); }
+  .hist-status.failed { color: var(--bad); border-color: var(--bad); background: rgba(255,82,82,.08); }
+
+  .hist-claims {
+    font-family: var(--mono); font-size: 10.5px; color: var(--text-3); letter-spacing: .08em;
+  }
+  .hist-actions { margin-left: auto; display: flex; gap: 6px; }
+  .hist-btn {
+    appearance: none; border: 1px solid var(--border); background: var(--surface);
+    color: var(--text-2); cursor: pointer;
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+    padding: 5px 10px; border-radius: 2px; transition: all .15s;
+  }
+  .hist-btn:hover { color: var(--text); border-color: var(--border-2); }
+  .hist-btn.primary { color: var(--flag); border-color: var(--flag); }
+  .hist-btn.primary:hover { background: var(--flag-soft); }
+
+  .hist-empty {
+    text-align: center; padding: 48px 0;
+    font-family: var(--mono); font-size: 12px; color: var(--text-3); letter-spacing: .1em;
+  }
+  .hist-loading {
+    text-align: center; padding: 32px 0;
+    font-family: var(--mono); font-size: 11px; color: var(--text-3); letter-spacing: .12em;
+    animation: blink 1.2s ease-in-out infinite;
+  }
+
 </style>
 </head>
 <body>
@@ -458,8 +556,24 @@
   <div class="auth-section">
     <label for="apiKeyInput">API Key</label>
     <input type="password" id="apiKeyInput" placeholder="输入 API Key..." />
+    <button class="nav-hist-btn" onclick="openHistory()">// 历史记录</button>
   </div>
 </nav>
+
+<!-- ───── HISTORY PANEL ───── -->
+<div class="hist-mask" id="histMask"></div>
+<aside class="hist-panel" id="histPanel">
+  <div class="hist-head">
+    <div>
+      <h3>历史记录</h3>
+      <div class="meta">最近 20 条核验任务</div>
+    </div>
+    <button class="x" id="histClose">×</button>
+  </div>
+  <div class="hist-body" id="histBody">
+    <div class="hist-loading">// 加载中…</div>
+  </div>
+</aside>
 
 <main>
 
@@ -1023,6 +1137,121 @@ updatePipeline("queued", "queued");
 const storedApiKey = localStorage.getItem("apiKey");
 if (storedApiKey) {
   document.getElementById("apiKeyInput").value = storedApiKey;
+}
+
+// ─────────── History panel ───────────
+
+function openHistory() {
+  document.getElementById("histPanel").classList.add("open");
+  document.getElementById("histMask").classList.add("open");
+  loadHistory();
+}
+
+function closeHistory() {
+  document.getElementById("histPanel").classList.remove("open");
+  document.getElementById("histMask").classList.remove("open");
+}
+
+document.getElementById("histClose").addEventListener("click", closeHistory);
+document.getElementById("histMask").addEventListener("click", closeHistory);
+
+function formatRelTime(isoStr) {
+  if (!isoStr) return "—";
+  const d = new Date(isoStr);
+  if (isNaN(d)) return isoStr;
+  const diffMs = Date.now() - d.getTime();
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return "刚刚";
+  if (diffMin < 60) return `${diffMin} 分钟前`;
+  const diffH = Math.floor(diffMin / 60);
+  if (diffH < 24) return `${diffH} 小时前`;
+  const diffD = Math.floor(diffH / 24);
+  if (diffD < 30) return `${diffD} 天前`;
+  return d.toLocaleDateString("zh-CN");
+}
+
+async function loadHistory() {
+  const body = document.getElementById("histBody");
+  body.innerHTML = `<div class="hist-loading">// 加载中…</div>`;
+  try {
+    const response = await fetchWithAuth(`${API_BASE}/api/runs?limit=20`);
+    if (!response.ok) throw new Error(await response.text());
+    const runs = await response.json();
+    renderHistory(runs);
+  } catch (error) {
+    body.innerHTML = `<div class="hist-empty">// 加载失败：${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function renderHistory(runs) {
+  const body = document.getElementById("histBody");
+  if (!runs.length) {
+    body.innerHTML = `<div class="hist-empty">// 暂无历史记录</div>`;
+    return;
+  }
+  body.innerHTML = runs.map((run) => {
+    const statusClass = run.status || "queued";
+    const statusLabel = { completed: "已完成", running: "运行中", queued: "排队中", failed: "失败" }[run.status] || run.status;
+    const filename = run.input_filename || (run.input_kind === "text" ? "粘贴文本" : "未知文件");
+    const shortId = (run.run_id || "").slice(0, 8).toUpperCase();
+    const claimsText = run.total_claims != null ? `${run.completed_claims ?? 0}/${run.total_claims} claims` : "";
+    const canView = run.status === "completed";
+    return `
+      <div class="hist-run" data-run-id="${escapeHtml(run.run_id)}">
+        <div class="hist-run-head" onclick="histViewRun('${escapeHtml(run.run_id)}', ${canView})">
+          <span class="run-id">0x${shortId}</span>
+          <span class="run-file">${escapeHtml(filename)}</span>
+          <span class="run-time">${formatRelTime(run.created_at)}</span>
+        </div>
+        <div class="hist-run-foot">
+          <span class="hist-status ${statusClass}">${statusLabel}</span>
+          ${claimsText ? `<span class="hist-claims">${escapeHtml(claimsText)}</span>` : ""}
+          <div class="hist-actions">
+            ${canView ? `<button class="hist-btn primary" onclick="histViewRun('${escapeHtml(run.run_id)}', true)">查看结果</button>` : ""}
+            ${canView ? `<button class="hist-btn" onclick="histDownload('${escapeHtml(run.run_id)}', '${escapeHtml(run.requested_format || 'json')}')">↓ ${(run.requested_format || 'json').toUpperCase()}</button>` : ""}
+          </div>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+async function histViewRun(runId, canView) {
+  if (!canView) return;
+  closeHistory();
+  setBusy(true, "加载历史结果…");
+  currentRows = [];
+  renderTable();
+  setSummary({});
+  updatePipeline("report", "completed");
+  try {
+    const statusResp = await fetchWithAuth(`${API_BASE}/api/runs/${runId}`);
+    if (!statusResp.ok) throw new Error(await statusResp.text());
+    const payload = await statusResp.json();
+    currentRun = payload.run;
+    setRunMeta(currentRun);
+    await loadResult(runId);
+  } catch (error) {
+    alert(`加载历史结果失败：${error.message}`);
+  } finally {
+    setBusy(false, "开始核验 →");
+  }
+}
+
+async function histDownload(runId, fmt) {
+  try {
+    const response = await fetchWithAuth(`${API_BASE}/api/runs/${runId}/download?fmt=${encodeURIComponent(fmt)}`);
+    if (!response.ok) throw new Error(await response.text());
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `verification-${runId}.${fmt}`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    alert(`下载失败：${error.message}`);
+  }
 }
 </script>
 

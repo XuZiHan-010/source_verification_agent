@@ -121,6 +121,15 @@ class MongoTaskStore:
         docs = self.artifacts.find({"run_id": run_id, "owner_id": owner_id}, {"_id": False})
         return [Artifact.model_validate(doc) for doc in docs]
 
+    def list_runs(self, owner_id: str, limit: int = 20, offset: int = 0) -> list[RunTask]:
+        docs = (
+            self.runs.find({"owner_id": owner_id}, {"_id": False})
+            .sort("created_at", self._descending)
+            .skip(offset)
+            .limit(limit)
+        )
+        return [RunTask.model_validate(doc) for doc in docs]
+
 
 def _collection(settings: Settings, name: str) -> str:
     return settings.mongodb.collections.get(name, name)

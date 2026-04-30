@@ -61,6 +61,8 @@ class TaskStore(Protocol):
 
     def list_artifacts(self, run_id: str, owner_id: str) -> list[Artifact]: ...
 
+    def list_runs(self, owner_id: str, limit: int = 20, offset: int = 0) -> list[RunTask]: ...
+
 
 class LocalTaskStore:
     """Tiny JSON-backed task store for local development and tests."""
@@ -160,6 +162,23 @@ class LocalTaskStore:
         if not path.exists():
             return []
         return [Artifact.model_validate(item) for item in json.loads(path.read_text(encoding="utf-8"))]
+
+    def list_runs(self, owner_id: str, limit: int = 20, offset: int = 0) -> list[RunTask]:
+        tasks = []
+        for run_dir in self.root.iterdir():
+            if not run_dir.is_dir():
+                continue
+            task_path = run_dir / "run.json"
+            if not task_path.exists():
+                continue
+            try:
+                task = RunTask.model_validate_json(task_path.read_text(encoding="utf-8"))
+                if task.owner_id == owner_id:
+                    tasks.append(task)
+            except Exception:
+                continue
+        tasks.sort(key=lambda t: t.created_at or datetime.min, reverse=True)
+        return tasks[offset : offset + limit]
 
     def _run_dir(self, run_id: str) -> Path:
         return self.root / run_id
