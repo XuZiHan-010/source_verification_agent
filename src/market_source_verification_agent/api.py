@@ -143,6 +143,21 @@ def create_app():
         path = path_from_storage_uri(artifact.storage_uri)
         return FileResponse(path, media_type=artifact.content_type, filename=artifact.filename)
 
+    @app.get("/api/runs/{run_id}/input")
+    def download_input(run_id: str, owner_id: Annotated[str, Depends(current_owner)]):
+        task = store.get_task(run_id, owner_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if not task.input_path:
+            raise HTTPException(status_code=404, detail="Input file not available")
+        path = path_from_storage_uri(task.input_path)
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="Input file not found on disk")
+        import mimetypes
+        media_type, _ = mimetypes.guess_type(str(path))
+        filename = task.input_filename or path.name
+        return FileResponse(path, media_type=media_type or "application/octet-stream", filename=filename)
+
     return app
 
 

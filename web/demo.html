@@ -1209,6 +1209,7 @@ function renderHistory(runs) {
           <div class="hist-actions">
             ${canView ? `<button class="hist-btn primary" onclick="histViewRun('${escapeHtml(run.run_id)}', true)">查看结果</button>` : ""}
             ${canView ? `<button class="hist-btn" onclick="histDownload('${escapeHtml(run.run_id)}', '${escapeHtml(run.requested_format || 'json')}')">↓ ${(run.requested_format || 'json').toUpperCase()}</button>` : ""}
+            ${run.input_filename ? `<button class="hist-btn" onclick="histDownloadInput('${escapeHtml(run.run_id)}')">↓ 原文件</button>` : ""}
           </div>
         </div>
       </div>
@@ -1251,6 +1252,25 @@ async function histDownload(runId, fmt) {
     URL.revokeObjectURL(url);
   } catch (error) {
     alert(`下载失败：${error.message}`);
+  }
+}
+
+async function histDownloadInput(runId) {
+  try {
+    const response = await fetchWithAuth(`${API_BASE}/api/runs/${runId}/input`);
+    if (!response.ok) throw new Error(await response.text());
+    const disposition = response.headers.get("content-disposition") || "";
+    const match = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)/i);
+    const filename = match ? decodeURIComponent(match[1]) : `input-${runId}`;
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    alert(`下载原文件失败：${error.message}`);
   }
 }
 </script>
