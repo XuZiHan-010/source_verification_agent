@@ -88,6 +88,47 @@ verify-sources my_text.txt   --fmt html --detailed -o report.html
 
 CLI 参数详见 [docs/07_orchestrator.md](docs/07_orchestrator.md#cli)。
 
+## Railway 部署
+
+本项目支持在 Railway 上的一键部署（FastAPI + Worker 共享同一容器）。
+
+### 环境变量配置
+
+Railway 项目 → 各服务 → **Variables**，按以下方式配置：
+
+| 变量名 | 值 | 说明 |
+|---|---|---|
+| `OPENAI_API_KEY` | 您的 OpenAI API Key | 用于文本提取、核验、分类 |
+| `MONGODB_URI` | MongoDB Atlas 连接串 | 保存任务状态、结果元数据 |
+| `REDIS_URL` | `${{Redis.REDIS_URL}}` | **关键**：引用 Railway Redis 插件，包含完整凭证 |
+| `API_KEYS` | 逗号分隔的 API Key 列表 | 保护 API 端点（可选） |
+
+#### Redis 认证修复
+
+如遇 `redis.exceptions.AuthenticationError: Authentication required` 错误：
+
+1. **FastAPI 服务**和 **Worker 服务**的 `REDIS_URL` 都要改为 `${{Redis.REDIS_URL}}`
+   - 不要用 `REDISHOST` / `REDISPORT` / `REDISPASSWORD` 分开变量拼接（容易漏密码）
+   - `${{Redis.REDIS_URL}}` 会自动展开为 `redis://default:<password>@<host>:<port>`
+2. 确保 Redis 服务和应用在**同一个 Railway 项目**，否则变量无法解析
+3. 改完触发 redeploy（或推送 Git 重新构建）
+
+### 容器启动
+
+[Dockerfile](Dockerfile) 在单个容器内同时启动 API 和 Worker：
+
+```dockerfile
+CMD ["bash", "-c", "python -m market_source_verification_agent.server & python -m market_source_verification_agent.worker; wait"]
+```
+
+两个进程共享 `/app/data/` 和 `/app/cache/` 目录（单机部署），如需扩展到多个 Worker 容器，需将存储后端改为对象存储（见 [config/settings.yaml](config/settings.yaml)）。
+
+### 故障排查
+
+- **Worker crash**：检查 `REDIS_URL` 是否包含完整凭证（含密码）
+- **任务卡在"pending"**：确认 Worker 容器正常运行，检查日志里是否有错误堆栈
+- **MongoDB 连接失败**：验证 `MONGODB_URI` 网络可达性（Railway 专网、IP 白名单等）
+
 ## 项目结构
 
 见 [CLAUDE.md](CLAUDE.md)。
