@@ -1,5 +1,2 @@
 [phases.setup]
 nixPkgs = ["python311"]
-
-[phases.install]
-cmds = ["pip install -e '.[ocr]' || pip install -e ."]
