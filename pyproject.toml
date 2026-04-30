@@ -1,0 +1,55 @@
+[project]
+name = "market-source-verification-agent"
+version = "0.1.0"
+description = "Verify and tier sources cited in market-research tables (PDF/Word/text input)."
+requires-python = ">=3.11"
+readme = "README.md"
+
+dependencies = [
+    "openai>=1.0.0",
+    "pdfplumber>=0.11",
+    "pymupdf>=1.24",
+    "python-docx>=1.1",
+    "markdown-it-py>=3.0",
+    "httpx[http2]>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "trafilatura>=1.12",
+    "rank-bm25>=0.2.2",
+    "pandas>=2.2",
+    "openpyxl>=3.1",
+    "jinja2>=3.1",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "tenacity>=8.3",
+    "rich>=13.7",
+    "charset-normalizer>=3.3",
+    "python-dotenv>=1.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "motor>=3.5",
+    "pymongo>=4.8",
+    "redis>=5.0",
+    "rq>=1.16",
+]
+
+[project.optional-dependencies]
+ocr           = ["paddleocr>=2.7"]
+embed-voyage  = ["voyageai>=0.2"]
+dev           = ["isort>=6.0", "pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5", "mypy>=1.10"]
+
+[project.scripts]
+verify-sources = "orchestrator.cli:main"
+source-verification-api = "market_source_verification_agent.server:main"
+source-verification-worker = "market_source_verification_agent.worker:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/market_source_verification_agent", "src/orchestrator"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

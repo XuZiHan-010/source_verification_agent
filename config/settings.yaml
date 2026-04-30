@@ -1,0 +1,73 @@
+models:
+  extractor:  gpt-5-mini
+  verifier:   gpt-5-mini
+  classifier: gpt-5-mini
+
+concurrency:
+  fetch_workers:        8
+  llm_workers:          4        # 进程内信号量 fallback
+  llm_global_max:       8        # Redis 全局信号量，多 Worker 部署以此为准
+  llm_global_backend:   redis
+  per_domain_max:       2        # 通过 Redis key domain_lock:<domain> 跨 Worker 协调
+
+cache:
+  dir:               data/cache/
+  fetch_ttl_days:    30
+  verify_ttl_days:   7
+  classify_ttl_days: 90
+
+storage:
+  backend:            local         # local | s3（阶段三只支持 local；多机部署再切 s3）
+  uploads_dir:        data/uploads
+  reports_dir:        data/reports
+  # s3:
+  #   bucket:         market-source-verification
+  #   region:         ap-east-1
+  #   endpoint_url:   null
+
+mongodb:
+  uri_env:            MONGODB_URI
+  database:           market_source_verification
+  collections:
+    runs:             runs
+    claims:           claims
+    events:           events
+    artifacts:        artifacts
+
+queue:
+  backend:              auto          # auto | local | redis-rq
+  redis_url_env:        REDIS_URL
+  default_queue:        source-verification
+  worker_concurrency:   2
+  job_timeout:          1800       # 单任务最长 30 分钟，RQ 超时后自动 kill
+  result_ttl:           86400      # 结果保留 1 天
+  failure_ttl:          604800     # 失败任务保留 7 天，便于排查
+  zombie_scan_interval: 300        # FastAPI 每 5 分钟扫一次僵尸 run
+
+auth:
+  api_keys_env:         API_KEYS   # 逗号分隔，或留空使用匿名 session token
+  session_token_ttl:    2592000    # 30 天
+  require_auth:         true
+
+runtime:
+  task_store_backend:   auto          # auto | local | mongodb
+
+web:
+  host:               0.0.0.0
+  port:               8000
+  cors_origins:
+    - http://localhost:8000
+    - http://localhost:5173
+  # 生产环境用 CORS_ORIGINS 环境变量覆盖（逗号分隔，或填 * ）
+
+search:
+  provider:    none        # no web search fallback; require source URL/hyperlink/whitelist
+  api_key_env: null
+
+output:
+  default_format:        xlsx
+  include_detail_column: false
+
+limits:
+  max_claims_per_run:   2000
+  per_claim_max_tokens: 8000

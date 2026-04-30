@@ -1,0 +1,962 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>源验 · Source Verify — 市场来源验证 Agent</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT@9..144,300..900,0..100&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+  /* ─────────── tokens ─────────── */
+  :root {
+    --bg:        #0a0a0b;
+    --bg-grain:  #0e0e10;
+    --surface:   #131316;
+    --surface-2: #1a1a1f;
+    --border:    #25252a;
+    --border-2:  #34343c;
+    --text:      #e8e8ea;
+    --text-2:    #a8a8b2;
+    --text-3:    #6b6b76;
+    --text-4:    #44444c;
+
+    --flag:      #ff3b30;
+    --flag-soft: rgba(255,59,48,.10);
+    --flag-line: rgba(255,59,48,.35);
+
+    --ok:        #34d399;
+    --warn:      #fbbf24;
+    --bad:       #ff5252;
+    --crit:      #b91c1c;
+    --mute:      #6b6b76;
+
+    --tier-a:    #4f7cff;
+    --tier-a-bg: rgba(79,124,255,.12);
+    --tier-b:    #19c3a6;
+    --tier-b-bg: rgba(25,195,166,.10);
+    --tier-c:    #ff3b30;
+    --tier-c-bg: rgba(255,59,48,.10);
+
+    --serif:     "Fraunces", "Instrument Serif", ui-serif, Georgia, serif;
+    --display:   "Instrument Serif", "Fraunces", ui-serif, Georgia, serif;
+    --sans:      "Noto Sans SC", -apple-system, "Helvetica Neue", sans-serif;
+    --mono:      "JetBrains Mono", ui-monospace, "Cascadia Code", "SF Mono", monospace;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body { background: var(--bg); color: var(--text); font-family: var(--sans); font-weight: 400; -webkit-font-smoothing: antialiased; line-height: 1.5; }
+
+  body {
+    background-image:
+      radial-gradient(circle at 80% -10%, rgba(79,124,255,.08), transparent 50%),
+      radial-gradient(circle at 0% 110%, rgba(255,59,48,.05), transparent 50%);
+    background-attachment: fixed;
+    min-height: 100vh;
+    position: relative;
+  }
+  /* film grain overlay */
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 1;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 .04 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    mix-blend-mode: overlay; opacity: .5;
+  }
+
+  ::selection { background: var(--flag); color: #fff; }
+
+  /* ─────────── nav ─────────── */
+  .nav {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(12px) saturate(140%);
+    background: rgba(10,10,11,.72);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 32px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .brand { display: flex; align-items: baseline; gap: 12px; }
+  .brand .glyph {
+    font-family: var(--display); font-size: 26px; line-height: 1;
+    letter-spacing: -.02em; color: var(--text);
+  }
+  .brand .glyph em { font-style: italic; color: var(--flag); }
+  .brand .sub {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .14em;
+    color: var(--text-3); text-transform: uppercase;
+  }
+  .nav .meta { font-family: var(--mono); font-size: 11px; color: var(--text-3); display: flex; gap: 18px; align-items: center; }
+  .nav .meta .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); display: inline-block; box-shadow: 0 0 8px var(--ok); animation: pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+  /* ─────────── layout ─────────── */
+  main { max-width: 1320px; margin: 0 auto; padding: 56px 32px 96px; position: relative; z-index: 2; }
+
+  /* ─────────── hero ─────────── */
+  .hero { display: grid; grid-template-columns: 1.1fr .9fr; gap: 64px; align-items: end; margin-bottom: 72px; }
+  @media (max-width: 960px) { .hero { grid-template-columns: 1fr; gap: 40px; } }
+
+  .hero h1 {
+    font-family: var(--display); font-weight: 400;
+    font-size: clamp(48px, 6.5vw, 92px);
+    line-height: .96; letter-spacing: -.025em;
+    color: var(--text);
+  }
+  .hero h1 em { font-style: italic; color: var(--flag); font-feature-settings: "ss01"; }
+  .hero h1 .strike { text-decoration: line-through; text-decoration-color: var(--flag); text-decoration-thickness: 2px; color: var(--text-3); }
+  .hero .lede {
+    margin-top: 22px; max-width: 460px;
+    font-size: 15px; color: var(--text-2); line-height: 1.7;
+  }
+  .hero .lede code { font-family: var(--mono); font-size: 12.5px; color: var(--text); background: var(--surface-2); padding: 1px 6px; border-radius: 3px; border: 1px solid var(--border); }
+
+  .hero .corner-meta {
+    margin-top: 28px; display: flex; gap: 28px;
+    font-family: var(--mono); font-size: 10.5px; color: var(--text-3);
+    letter-spacing: .12em; text-transform: uppercase;
+  }
+  .hero .corner-meta b { color: var(--text-2); font-weight: 500; }
+
+  /* upload pane */
+  .upload {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; overflow: hidden;
+    box-shadow: 0 24px 60px -20px rgba(0,0,0,.6);
+  }
+  .upload-tabs {
+    display: flex; border-bottom: 1px solid var(--border);
+    font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+  }
+  .upload-tabs button {
+    flex: 1; background: transparent; border: 0; color: var(--text-3);
+    padding: 14px 16px; cursor: pointer; transition: color .15s;
+    border-right: 1px solid var(--border);
+    position: relative;
+  }
+  .upload-tabs button:last-child { border-right: 0; }
+  .upload-tabs button:hover { color: var(--text-2); }
+  .upload-tabs button.active { color: var(--text); }
+  .upload-tabs button.active::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
+    background: var(--flag);
+  }
+
+  .upload-body { padding: 28px; }
+
+  .dropzone {
+    border: 1.5px dashed var(--border-2); border-radius: 3px;
+    padding: 48px 24px; text-align: center;
+    transition: border-color .2s, background .2s;
+    cursor: pointer; position: relative;
+  }
+  .dropzone:hover, .dropzone.drag {
+    border-color: var(--flag); background: var(--flag-soft);
+  }
+  .dropzone .icon {
+    width: 44px; height: 44px; margin: 0 auto 16px;
+    border: 1px solid var(--border-2); border-radius: 3px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-2); font-family: var(--mono); font-size: 16px;
+  }
+  .dropzone:hover .icon, .dropzone.drag .icon { border-color: var(--flag); color: var(--flag); }
+  .dropzone .label { font-family: var(--display); font-style: italic; font-size: 22px; color: var(--text); margin-bottom: 6px; }
+  .dropzone .hint { font-family: var(--mono); font-size: 11px; color: var(--text-3); letter-spacing: .08em; }
+  .dropzone input { display: none; }
+
+  textarea.paste {
+    width: 100%; min-height: 200px; resize: vertical;
+    background: var(--bg-grain); border: 1px solid var(--border);
+    border-radius: 3px; padding: 14px 16px;
+    color: var(--text); font-family: var(--mono); font-size: 12.5px; line-height: 1.6;
+    outline: none; transition: border-color .15s;
+  }
+  textarea.paste:focus { border-color: var(--flag); }
+
+  .submit-row {
+    margin-top: 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  }
+  .submit-row .opts {
+    font-family: var(--mono); font-size: 11px; color: var(--text-3); letter-spacing: .08em;
+  }
+  .btn {
+    appearance: none; border: 0; cursor: pointer;
+    font-family: var(--mono); font-size: 12px; letter-spacing: .14em; text-transform: uppercase;
+    padding: 12px 22px; border-radius: 3px;
+    transition: transform .12s, background .15s, color .15s;
+  }
+  .btn-primary { background: var(--flag); color: #fff; }
+  .btn-primary:hover { background: #ff5246; }
+  .btn-primary:active { transform: translateY(1px); }
+  .btn-ghost { background: transparent; color: var(--text-2); border: 1px solid var(--border); }
+  .btn-ghost:hover { color: var(--text); border-color: var(--border-2); }
+
+  /* ─────────── pipeline ─────────── */
+  .pipeline-section { margin-bottom: 56px; }
+  .section-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid var(--border);
+  }
+  .section-head h2 {
+    font-family: var(--display); font-style: italic; font-weight: 400;
+    font-size: 30px; letter-spacing: -.01em;
+  }
+  .section-head h2::before {
+    content: attr(data-num); font-family: var(--mono); font-style: normal;
+    font-size: 11px; color: var(--text-3); letter-spacing: .14em; margin-right: 14px;
+    vertical-align: 5px;
+  }
+  .section-head .right { font-family: var(--mono); font-size: 11px; color: var(--text-3); letter-spacing: .12em; text-transform: uppercase; }
+
+  .pipeline {
+    display: grid; grid-template-columns: repeat(6, 1fr); gap: 0;
+    border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
+    background: var(--surface);
+  }
+  .stage {
+    padding: 18px 20px; border-right: 1px solid var(--border);
+    position: relative; transition: background .25s;
+  }
+  .stage:last-child { border-right: 0; }
+  .stage .num { font-family: var(--mono); font-size: 10px; color: var(--text-4); letter-spacing: .15em; }
+  .stage .name { font-family: var(--display); font-style: italic; font-size: 20px; margin-top: 6px; color: var(--text-2); }
+  .stage .status { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); letter-spacing: .1em; text-transform: uppercase; margin-top: 12px; display: flex; align-items: center; gap: 8px; }
+  .stage .status::before {
+    content: ""; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--text-4); box-shadow: 0 0 0 transparent;
+    transition: all .3s;
+  }
+  .stage.done .name { color: var(--text); }
+  .stage.done .status { color: var(--ok); }
+  .stage.done .status::before { background: var(--ok); box-shadow: 0 0 12px var(--ok); }
+  .stage.active { background: linear-gradient(180deg, rgba(255,59,48,.06), transparent); }
+  .stage.active .name { color: var(--text); }
+  .stage.active .status { color: var(--flag); }
+  .stage.active .status::before { background: var(--flag); box-shadow: 0 0 12px var(--flag); animation: blink 1s ease-in-out infinite; }
+  @keyframes blink { 50% { opacity: .35; } }
+
+  .stage .bar {
+    position: absolute; bottom: 0; left: 0; height: 1.5px;
+    background: var(--flag); width: 0; transition: width .8s ease;
+  }
+  .stage.done .bar { width: 100%; background: var(--ok); }
+  .stage.active .bar { width: 65%; }
+
+  /* ─────────── summary ─────────── */
+  .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; background: var(--surface); margin-bottom: 64px; }
+  @media (max-width: 880px) { .summary { grid-template-columns: repeat(2, 1fr); } }
+
+  .stat { padding: 24px 26px; border-right: 1px solid var(--border); position: relative; }
+  .stat:nth-child(2n) { border-right: 1px solid var(--border); }
+  .stat:last-child { border-right: 0; }
+  @media (max-width: 880px) { .stat:nth-child(2n) { border-right: 0; } .stat:nth-child(-n+2) { border-bottom: 1px solid var(--border); } }
+
+  .stat .label { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); letter-spacing: .14em; text-transform: uppercase; }
+  .stat .value { font-family: var(--display); font-size: 56px; line-height: 1; margin-top: 14px; letter-spacing: -.02em; color: var(--text); }
+  .stat .value sup { font-size: 14px; color: var(--text-3); margin-left: 4px; vertical-align: top; font-family: var(--mono); }
+  .stat .breakdown {
+    margin-top: 16px; display: flex; gap: 4px; height: 4px; border-radius: 2px; overflow: hidden;
+  }
+  .stat .breakdown span { display: block; }
+  .stat .legend { margin-top: 12px; display: flex; gap: 16px; font-family: var(--mono); font-size: 10.5px; color: var(--text-3); }
+  .stat .legend i { font-style: normal; color: var(--text); }
+  .stat .legend .sw { display: inline-block; width: 7px; height: 7px; border-radius: 1px; margin-right: 5px; vertical-align: middle; }
+
+  /* ─────────── report table ─────────── */
+  .report-bar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .filter-pill {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
+    padding: 6px 10px; border: 1px solid var(--border); border-radius: 2px;
+    background: var(--surface); color: var(--text-2); cursor: pointer;
+    transition: all .15s;
+  }
+  .filter-pill:hover { color: var(--text); border-color: var(--border-2); }
+  .filter-pill.active { background: var(--text); color: var(--bg); border-color: var(--text); }
+  .filter-pill .ct { color: var(--text-3); margin-left: 6px; }
+  .filter-pill.active .ct { color: var(--text-3); }
+  .report-bar .spacer { flex: 1; }
+
+  .download-group { display: flex; gap: 0; border: 1px solid var(--border); border-radius: 2px; overflow: hidden; }
+  .download-group button {
+    background: var(--surface); border: 0; color: var(--text-2); cursor: pointer;
+    font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+    padding: 8px 14px; border-right: 1px solid var(--border);
+    transition: all .15s;
+  }
+  .download-group button:last-child { border-right: 0; }
+  .download-group button:hover { background: var(--surface-2); color: var(--text); }
+  .download-group button.featured { color: var(--flag); }
+
+  .table-wrap {
+    border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
+    background: var(--surface);
+  }
+  table.report {
+    width: 100%; border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.report thead th {
+    text-align: left; font-family: var(--mono);
+    font-size: 10.5px; font-weight: 500; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--text-3); padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-grain);
+    white-space: nowrap;
+  }
+  table.report thead th.added {
+    color: var(--flag); border-left: 1px solid var(--border);
+  }
+  table.report tbody td {
+    padding: 14px 16px; border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  table.report tbody tr:last-child td { border-bottom: 0; }
+  table.report tbody tr { transition: background .12s; cursor: pointer; }
+  table.report tbody tr:hover { background: rgba(255,255,255,.018); }
+  table.report tbody tr.flagged { background: rgba(255,59,48,.035); }
+  table.report tbody tr.flagged:hover { background: rgba(255,59,48,.06); }
+  table.report tbody tr.flagged td:first-child { box-shadow: inset 2px 0 0 var(--flag); }
+
+  td .row-id { font-family: var(--mono); font-size: 10.5px; color: var(--text-4); letter-spacing: .05em; }
+  td .metric { font-weight: 500; color: var(--text); }
+  td .num { font-family: var(--mono); font-feature-settings: "tnum"; color: var(--text); }
+  td .year { font-family: var(--mono); color: var(--text-2); }
+  td .src {
+    color: var(--text-2); font-size: 13px; line-height: 1.55;
+    max-width: 280px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  td .src .domain {
+    font-family: var(--mono); font-size: 11px; color: var(--text-3);
+    display: block; margin-top: 4px; letter-spacing: .03em;
+  }
+
+  .verdict {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .verdict::before {
+    content: ""; width: 8px; height: 8px; border-radius: 50%;
+  }
+  .verdict.supported { color: var(--ok); }
+  .verdict.supported::before { background: var(--ok); box-shadow: 0 0 8px rgba(52,211,153,.6); }
+  .verdict.partial { color: var(--warn); }
+  .verdict.partial::before { background: var(--warn); }
+  .verdict.notfound { color: var(--bad); }
+  .verdict.notfound::before { background: var(--bad); box-shadow: 0 0 10px rgba(255,82,82,.6); }
+  .verdict.contradicted { color: #fff; background: var(--crit); padding: 4px 8px; border-radius: 2px; }
+  .verdict.contradicted::before { background: #fff; box-shadow: 0 0 6px #fff; }
+  .verdict.notverif { color: var(--mute); }
+  .verdict.notverif::before { background: var(--mute); }
+
+  .tier {
+    display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 600;
+    padding: 4px 9px; border-radius: 2px; letter-spacing: .08em;
+    border: 1px solid;
+  }
+  .tier.A { color: var(--tier-a); border-color: var(--tier-a); background: var(--tier-a-bg); }
+  .tier.B { color: var(--tier-b); border-color: var(--tier-b); background: var(--tier-b-bg); }
+  .tier.C { color: var(--tier-c); border-color: var(--tier-c); background: var(--tier-c-bg); box-shadow: 0 0 0 3px rgba(255,59,48,.05); }
+
+  td.col-verdict, td.col-tier { background: var(--bg-grain); }
+
+  /* ─────────── drawer ─────────── */
+  .drawer-mask {
+    position: fixed; inset: 0; background: rgba(0,0,0,.65); backdrop-filter: blur(4px);
+    z-index: 60; opacity: 0; pointer-events: none; transition: opacity .25s;
+  }
+  .drawer-mask.open { opacity: 1; pointer-events: auto; }
+  .drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 100%);
+    background: var(--surface); border-left: 1px solid var(--border);
+    transform: translateX(100%); transition: transform .35s cubic-bezier(.2,.8,.2,1);
+    z-index: 61; overflow-y: auto;
+    box-shadow: -40px 0 80px -20px rgba(0,0,0,.7);
+  }
+  .drawer.open { transform: translateX(0); }
+  .drawer-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 28px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: var(--surface); z-index: 2;
+  }
+  .drawer-head .id { font-family: var(--mono); font-size: 11px; color: var(--text-3); letter-spacing: .12em; }
+  .drawer-head .x { background: transparent; border: 0; color: var(--text-2); font-size: 22px; cursor: pointer; line-height: 1; }
+  .drawer-body { padding: 28px; }
+
+  .dr-row { padding: 14px 0; border-bottom: 1px dashed var(--border); display: grid; grid-template-columns: 110px 1fr; gap: 16px; align-items: baseline; }
+  .dr-row:last-child { border-bottom: 0; }
+  .dr-row .k { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); letter-spacing: .14em; text-transform: uppercase; }
+  .dr-row .v { color: var(--text); font-size: 14px; line-height: 1.6; }
+  .dr-row .v.mono { font-family: var(--mono); font-size: 13px; }
+  .dr-row .v a { color: var(--tier-a); text-decoration: none; border-bottom: 1px solid var(--tier-a); }
+
+  .quote {
+    margin-top: 24px; padding: 22px 24px;
+    border-left: 2px solid var(--flag);
+    background: linear-gradient(90deg, var(--flag-soft), transparent 60%);
+    font-family: var(--display); font-style: italic; font-size: 18px;
+    line-height: 1.55; color: var(--text);
+    position: relative;
+  }
+  .quote::before {
+    content: "“"; position: absolute; left: 6px; top: -4px;
+    font-family: var(--display); font-size: 64px; color: var(--flag); opacity: .35;
+  }
+  .quote .src { display: block; margin-top: 12px; font-family: var(--mono); font-style: normal; font-size: 11px; letter-spacing: .12em; color: var(--text-3); text-transform: uppercase; }
+
+  .reasoning { margin-top: 18px; padding: 16px 18px; background: var(--bg-grain); border: 1px solid var(--border); border-radius: 3px; font-size: 13.5px; color: var(--text-2); line-height: 1.65; }
+  .reasoning b { color: var(--text); font-weight: 500; }
+
+  /* ─────────── footer ─────────── */
+  footer {
+    margin-top: 96px; padding-top: 32px; border-top: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-family: var(--mono); font-size: 11px; color: var(--text-3); letter-spacing: .1em;
+  }
+  footer em { font-style: italic; color: var(--flag); }
+
+  /* asymmetric corner numerals */
+  .ornament {
+    position: fixed; bottom: 24px; left: 24px; z-index: 5;
+    font-family: var(--display); font-style: italic; font-size: 14px;
+    color: var(--text-4); pointer-events: none;
+  }
+  .ornament .v { color: var(--flag); }
+
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="brand">
+    <span class="glyph">源<em>验</em></span>
+    <span class="sub">Source · Verify v0.1</span>
+  </div>
+  <div class="meta">
+    <span><span class="dot"></span>&nbsp;ENGINE READY</span>
+    <span>RUN · 0xA31F</span>
+    <span>2026-04-29 · UTC+8</span>
+  </div>
+</nav>
+
+<main>
+
+<!-- ───── HERO ───── -->
+<section class="hero">
+  <div>
+    <h1>核验 <em>来源</em>。<br><span class="strike">轻信</span> 标记。</h1>
+    <p class="lede">
+      上传你整理的市场研究表格（<code>.pdf</code> / <code>.docx</code> / 粘贴文本），逐行核对所引用来源是否真实包含相应数据，并按权威性分入 <code>A · B · C</code> 三级。可疑行将被标红 — 不替你下结论，但替你点出疑点。
+    </p>
+    <div class="corner-meta">
+      <span><b>2 PDFs</b> · 含 89 行 claim</span>
+      <span>↳ <b>89/89</b> 已结算</span>
+      <span>耗时 <b>3m 42s</b></span>
+    </div>
+  </div>
+
+  <div class="upload">
+    <div class="upload-tabs" role="tablist">
+      <button class="active" data-tab="file">// 上传文件</button>
+      <button data-tab="paste">// 粘贴文本</button>
+    </div>
+
+    <div class="upload-body" data-pane="file">
+      <label class="dropzone" id="drop">
+        <div class="icon">↑</div>
+        <div class="label">把文档拖进来</div>
+        <div class="hint">PDF · DOCX · MD · TXT — 最大 25 MB</div>
+        <input type="file" accept=".pdf,.docx,.txt,.md" />
+      </label>
+      <div class="submit-row">
+        <span class="opts">// 默认引擎: gpt-5-mini · 缓存开启</span>
+        <button class="btn btn-primary" onclick="runDemo()">开始核验 →</button>
+      </div>
+    </div>
+
+    <div class="upload-body" data-pane="paste" style="display:none">
+      <textarea class="paste" placeholder="// 在此粘贴 Markdown 表格或 CSV…&#10;指标 | 数值 | 年份 | 来源&#10;低空经济规模 | 5059.5亿元 | 2023 | 赛迪研究院"></textarea>
+      <div class="submit-row">
+        <span class="opts">// 自动识别表头</span>
+        <button class="btn btn-primary" onclick="runDemo()">开始核验 →</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───── PIPELINE ───── -->
+<section class="pipeline-section">
+  <div class="section-head">
+    <h2 data-num="01 ──">processing pipeline</h2>
+    <span class="right">RUN 0xA31F · 89 claims</span>
+  </div>
+
+  <div class="pipeline" id="pipeline">
+    <div class="stage done"><div class="num">01</div><div class="name">Ingest</div><div class="status">parsed · 16 pages</div><div class="bar"></div></div>
+    <div class="stage done"><div class="num">02</div><div class="name">Extract</div><div class="status">89 claims</div><div class="bar"></div></div>
+    <div class="stage done"><div class="num">03</div><div class="name">Resolve</div><div class="status">71 ok · 18 fail</div><div class="bar"></div></div>
+    <div class="stage done"><div class="num">04</div><div class="name">Verify</div><div class="status">complete</div><div class="bar"></div></div>
+    <div class="stage done"><div class="num">05</div><div class="name">Classify</div><div class="status">complete</div><div class="bar"></div></div>
+    <div class="stage active"><div class="num">06</div><div class="name">Report</div><div class="status">rendering…</div><div class="bar"></div></div>
+  </div>
+</section>
+
+<!-- ───── SUMMARY ───── -->
+<section>
+  <div class="section-head">
+    <h2 data-num="02 ──">verdict summary</h2>
+    <span class="right">8 sample rows · click to inspect</span>
+  </div>
+
+  <div class="summary">
+    <div class="stat">
+      <div class="label">total claims</div>
+      <div class="value">89<sup>行</sup></div>
+      <div class="breakdown">
+        <span style="background: var(--ok); width: 56%"></span>
+        <span style="background: var(--warn); width: 14%"></span>
+        <span style="background: var(--bad); width: 9%"></span>
+        <span style="background: var(--crit); width: 4%"></span>
+        <span style="background: var(--mute); width: 17%"></span>
+      </div>
+      <div class="legend">
+        <span><i class="sw" style="background:var(--ok)"></i></i><i>50</i> 支持</span>
+        <span><i class="sw" style="background:var(--bad)"></i><i>8</i> 未找到</span>
+      </div>
+    </div>
+
+    <div class="stat">
+      <div class="label">tier · A 官方权威</div>
+      <div class="value" style="color:var(--tier-a)">31</div>
+      <div class="breakdown" style="margin-top: 26px">
+        <span style="background: var(--tier-a); width: 100%"></span>
+      </div>
+      <div class="legend">
+        <span><i>34.8%</i> 占比</span><span>政府 · 监管 · 公报</span>
+      </div>
+    </div>
+
+    <div class="stat">
+      <div class="label">tier · B 主流可信</div>
+      <div class="value" style="color:var(--tier-b)">42</div>
+      <div class="breakdown" style="margin-top: 26px">
+        <span style="background: var(--tier-b); width: 100%"></span>
+      </div>
+      <div class="legend">
+        <span><i>47.2%</i> 占比</span><span>媒体 · 券商 · 上市公司</span>
+      </div>
+    </div>
+
+    <div class="stat" style="background: linear-gradient(180deg, rgba(255,59,48,.05), transparent)">
+      <div class="label" style="color: var(--flag)">tier · C 不知名 ⚑</div>
+      <div class="value" style="color:var(--tier-c)">16</div>
+      <div class="breakdown" style="margin-top: 26px">
+        <span style="background: var(--tier-c); width: 100%"></span>
+      </div>
+      <div class="legend">
+        <span><i>18.0%</i> 占比</span><span>建议复核</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───── REPORT ───── -->
+<section>
+  <div class="section-head">
+    <h2 data-num="03 ──">verified report</h2>
+    <span class="right">原表格 + 追加两列 →</span>
+  </div>
+
+  <div class="report-bar">
+    <button class="filter-pill active" data-filter="all">全部 <span class="ct">8</span></button>
+    <button class="filter-pill" data-filter="flagged">⚑ 仅可疑 <span class="ct">3</span></button>
+    <button class="filter-pill" data-filter="C">C 类来源 <span class="ct">2</span></button>
+    <button class="filter-pill" data-filter="supported">已支持 <span class="ct">4</span></button>
+    <span class="spacer"></span>
+    <div class="download-group">
+      <button class="featured">↓ XLSX</button>
+      <button>MD</button>
+      <button>HTML</button>
+      <button>JSON</button>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="report" id="report">
+      <thead>
+        <tr>
+          <th style="width: 56px">#</th>
+          <th>指标</th>
+          <th>数值</th>
+          <th>年份</th>
+          <th>来源名称</th>
+          <th class="added">来源是否真实</th>
+          <th class="added">来源类别</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<footer>
+  <span>源验 / Source · Verify — <em>架构阶段一</em> · demo build</span>
+  <span>made with care · 2026</span>
+</footer>
+
+</main>
+
+<!-- ───── DRAWER ───── -->
+<div class="drawer-mask" id="mask"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <span class="id" id="drawer-id">CLAIM #—</span>
+    <button class="x" id="drawer-close">×</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<div class="ornament">// session <span class="v">0xA31F</span> · live</div>
+
+<script>
+const API_BASE = "";
+const PIPELINE_STAGES = ["ingest", "extract", "resolve", "verify", "classify", "report"];
+const VERDICT_META = {
+  "✅ 支持": { cls: "supported", key: "supported" },
+  "⚠️ 部分支持": { cls: "partial", key: "partial" },
+  "❌ 未找到": { cls: "notfound", key: "notfound" },
+  "❗ 矛盾": { cls: "contradicted", key: "contradicted" },
+  "❓ 无法验证": { cls: "notverif", key: "notverif" },
+};
+
+let currentFilter = "all";
+let currentRows = [];
+let currentRun = null;
+let selectedFile = null;
+
+const fileInput = document.querySelector('.dropzone input');
+const drop = document.getElementById("drop");
+const pasteArea = document.querySelector("textarea.paste");
+const fileRunButton = document.querySelector('[data-pane="file"] .btn-primary');
+const textRunButton = document.querySelector('[data-pane="paste"] .btn-primary');
+const filterButtons = Array.from(document.querySelectorAll(".filter-pill"));
+const downloadButtons = Array.from(document.querySelectorAll(".download-group button"));
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function normalizeRow(row, index) {
+  const sourceUrl = row["来源URL提示"] || null;
+  const verdictLabel = row["来源是否真实"] || "❓ 无法验证";
+  const verdictMeta = VERDICT_META[verdictLabel] || VERDICT_META["❓ 无法验证"];
+  const sourceName = row["来源名称"] || "";
+  const domain = sourceUrl ? new URL(sourceUrl).hostname : (sourceName.match(/([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/)?.[0] || "—");
+  return {
+    id: row["章节"] ? `${row["章节"]}#${index + 1}` : `claim#${index + 1}`,
+    metric: row["指标"] || "—",
+    value: row["数值"] || "—",
+    year: row["年份"] || "—",
+    region: row["地区/口径"] || "—",
+    src: sourceName || "—",
+    domain,
+    verdictLabel,
+    verdictClass: verdictMeta.cls,
+    verdictKey: verdictMeta.key,
+    tier: row["来源类别"] || "C",
+    quote: row["核验佐证"] || null,
+    locator: sourceUrl ? domain : "—",
+    reasoning: row["核验佐证"] || row["事实声明"] || "—",
+    url: sourceUrl,
+    statement: row["事实声明"] || "",
+  };
+}
+
+function filteredRows() {
+  return currentRows.filter((row) => {
+    const flagged = ["notfound", "contradicted"].includes(row.verdictKey) || row.tier === "C";
+    if (currentFilter === "flagged") return flagged;
+    if (currentFilter === "C") return row.tier === "C";
+    if (currentFilter === "supported") return row.verdictKey === "supported";
+    return true;
+  });
+}
+
+function renderTable() {
+  const tbody = document.querySelector("#report tbody");
+  tbody.innerHTML = "";
+  filteredRows().forEach((row, index) => {
+    const flagged = ["notfound", "contradicted"].includes(row.verdictKey) || row.tier === "C";
+    const tr = document.createElement("tr");
+    if (flagged) tr.classList.add("flagged");
+    tr.innerHTML = `
+      <td><span class="row-id">${String(index + 1).padStart(2, "0")}</span></td>
+      <td><span class="metric">${escapeHtml(row.metric)}</span></td>
+      <td><span class="num">${escapeHtml(row.value)}</span></td>
+      <td><span class="year">${escapeHtml(row.year)}</span></td>
+      <td><div class="src">${escapeHtml(row.src)}<span class="domain">↗ ${escapeHtml(row.domain)}</span></div></td>
+      <td class="col-verdict"><span class="verdict ${row.verdictClass}">${escapeHtml(row.verdictLabel)}</span></td>
+      <td class="col-tier"><span class="tier ${escapeHtml(row.tier)}">${escapeHtml(row.tier)}</span></td>
+    `;
+    tr.addEventListener("click", () => openDrawer(row));
+    tbody.appendChild(tr);
+  });
+  if (!tbody.children.length) {
+    tbody.innerHTML = `<tr><td colspan="7" style="padding:24px 16px;color:var(--text-3);font-family:var(--mono)">// 当前筛选条件下无结果</td></tr>`;
+  }
+}
+
+function openDrawer(row) {
+  document.getElementById("drawer-id").textContent = "CLAIM " + row.id;
+  const body = document.getElementById("drawer-body");
+  body.innerHTML = `
+    <div class="dr-row"><div class="k">指标</div><div class="v">${escapeHtml(row.metric)}</div></div>
+    <div class="dr-row"><div class="k">数值</div><div class="v mono">${escapeHtml(row.value)}</div></div>
+    <div class="dr-row"><div class="k">年份</div><div class="v mono">${escapeHtml(row.year)}</div></div>
+    <div class="dr-row"><div class="k">地区</div><div class="v">${escapeHtml(row.region)}</div></div>
+    <div class="dr-row"><div class="k">声明</div><div class="v">${escapeHtml(row.statement)}</div></div>
+    <div class="dr-row"><div class="k">来源</div><div class="v">${escapeHtml(row.src)}<br>${row.url ? `<a href="${row.url}" target="_blank">${escapeHtml(row.url)}</a>` : `<span class="mono" style="color:var(--text-3)">// 无可访问链接</span>`}</div></div>
+    <div class="dr-row"><div class="k">verdict</div><div class="v"><span class="verdict ${row.verdictClass}">${escapeHtml(row.verdictLabel)}</span></div></div>
+    <div class="dr-row"><div class="k">类别</div><div class="v"><span class="tier ${escapeHtml(row.tier)}">${escapeHtml(row.tier)}</span></div></div>
+    ${row.quote ? `<div class="quote">${escapeHtml(row.quote)}<span class="src">${escapeHtml(row.locator)}</span></div>` : `<div class="reasoning" style="margin-top:24px"><b>核验佐证缺失</b> — 当前结构化结果未附带原文片段。</div>`}
+    <div class="reasoning"><b>// 详情</b> &nbsp; ${escapeHtml(row.reasoning)}</div>
+  `;
+  document.getElementById("drawer").classList.add("open");
+  document.getElementById("mask").classList.add("open");
+}
+
+function closeDrawer() {
+  document.getElementById("drawer").classList.remove("open");
+  document.getElementById("mask").classList.remove("open");
+}
+
+function setSummary(summary = {}) {
+  const total = summary.total || currentRows.length || 0;
+  const supported = summary.supported || 0;
+  const partial = summary.partially_supported || 0;
+  const notfound = summary.not_found || 0;
+  const contradicted = summary.contradicted || 0;
+  const notverifiable = summary.not_verifiable || 0;
+  const a = summary.A || 0;
+  const b = summary.B || 0;
+  const c = summary.C || 0;
+  const stats = document.querySelectorAll(".summary .stat");
+  stats[0].querySelector(".value").innerHTML = `${total}<sup>行</sup>`;
+  stats[0].querySelector(".breakdown").innerHTML = makeBreakdown([
+    ["var(--ok)", supported, total],
+    ["var(--warn)", partial, total],
+    ["var(--bad)", notfound, total],
+    ["var(--crit)", contradicted, total],
+    ["var(--mute)", notverifiable, total],
+  ]);
+  stats[0].querySelector(".legend").innerHTML = `
+    <span><i class="sw" style="background:var(--ok)"></i><i>${supported}</i> 支持</span>
+    <span><i class="sw" style="background:var(--bad)"></i><i>${notfound}</i> 未找到</span>
+  `;
+  updateTierStat(stats[1], "A", a, total, "var(--tier-a)", "政府 · 监管 · 公报");
+  updateTierStat(stats[2], "B", b, total, "var(--tier-b)", "媒体 · 券商 · 上市公司");
+  updateTierStat(stats[3], "C", c, total, "var(--tier-c)", "建议复核");
+}
+
+function updateTierStat(stat, label, value, total, color, note) {
+  stat.querySelector(".value").textContent = String(value);
+  stat.querySelector(".breakdown").innerHTML = makeBreakdown([[color, value, Math.max(value, 1)]]);
+  stat.querySelector(".legend").innerHTML = `<span><i>${total ? ((value / total) * 100).toFixed(1) : "0.0"}%</i> 占比</span><span>${note}</span>`;
+}
+
+function makeBreakdown(items) {
+  return items.map(([color, value, total]) => `<span style="background:${color};width:${total ? Math.max((value / total) * 100, value ? 4 : 0) : 0}%"></span>`).join("");
+}
+
+function updateFilterCounts() {
+  const counts = {
+    all: currentRows.length,
+    flagged: currentRows.filter((row) => ["notfound", "contradicted"].includes(row.verdictKey) || row.tier === "C").length,
+    C: currentRows.filter((row) => row.tier === "C").length,
+    supported: currentRows.filter((row) => row.verdictKey === "supported").length,
+  };
+  filterButtons.forEach((button) => {
+    const ct = button.querySelector(".ct");
+    if (ct) ct.textContent = counts[button.dataset.filter] ?? 0;
+  });
+}
+
+function updatePipeline(stage = "queued", status = "queued") {
+  const stageEls = document.querySelectorAll("#pipeline .stage");
+  const currentIndex = PIPELINE_STAGES.indexOf(stage);
+  stageEls.forEach((element, index) => {
+    element.classList.remove("done", "active");
+    const statusEl = element.querySelector(".status");
+    if (index < currentIndex || status === "completed") {
+      element.classList.add("done");
+      statusEl.textContent = "complete";
+    } else if (index === currentIndex) {
+      element.classList.add("active");
+      statusEl.textContent = status === "failed" ? "failed" : "running";
+    } else {
+      statusEl.textContent = "waiting";
+    }
+  });
+}
+
+function setRunMeta(run) {
+  const meta = document.querySelector(".hero .corner-meta");
+  if (!run) {
+    meta.innerHTML = `<span><b>0</b> claims</span><span>↳ <b>0/0</b> 已结算</span><span>状态 <b>idle</b></span>`;
+    return;
+  }
+  meta.innerHTML = `
+    <span><b>${run.total_claims || 0}</b> claims</span>
+    <span>↳ <b>${run.completed_claims || 0}/${run.total_claims || 0}</b> 已结算</span>
+    <span>状态 <b>${run.status}</b></span>
+  `;
+  const pipelineHead = document.querySelector(".pipeline-section .right");
+  pipelineHead.textContent = `RUN ${run.run_id.slice(0, 8)} · ${run.total_claims || 0} claims`;
+}
+
+function setBusy(isBusy, label) {
+  [fileRunButton, textRunButton].forEach((button) => {
+    button.disabled = isBusy;
+    button.textContent = isBusy ? label : "开始核验 →";
+  });
+}
+
+async function submitRun() {
+  const form = new FormData();
+  form.append("fmt", "json");
+  form.append("detailed", "true");
+  if (selectedFile) {
+    form.append("file", selectedFile);
+  } else {
+    const text = pasteArea.value.trim();
+    if (!text) {
+      alert("请先上传文件或粘贴文本。");
+      return;
+    }
+    form.append("text", text);
+  }
+
+  setBusy(true, "提交中…");
+  currentRows = [];
+  renderTable();
+  setSummary({});
+  setRunMeta(null);
+  updatePipeline("ingest", "running");
+
+  try {
+    const response = await fetch(`${API_BASE}/api/runs`, { method: "POST", body: form });
+    if (!response.ok) throw new Error(await response.text());
+    currentRun = await response.json();
+    setRunMeta(currentRun);
+    await pollRun(currentRun.run_id);
+  } catch (error) {
+    alert(`创建任务失败：${error.message}`);
+    updatePipeline("report", "failed");
+  } finally {
+    setBusy(false, "开始核验 →");
+  }
+}
+
+async function pollRun(runId) {
+  while (true) {
+    const response = await fetch(`${API_BASE}/api/runs/${runId}`);
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    currentRun = payload.run;
+    setRunMeta(currentRun);
+    updatePipeline(currentRun.current_stage, currentRun.status);
+    if (currentRun.status === "completed") {
+      await loadResult(runId);
+      return;
+    }
+    if (currentRun.status === "failed") {
+      throw new Error(currentRun.error || "任务执行失败");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+  }
+}
+
+async function loadResult(runId) {
+  const response = await fetch(`${API_BASE}/api/runs/${runId}/result`);
+  if (!response.ok) throw new Error(await response.text());
+  const payload = await response.json();
+  currentRows = payload.map(normalizeRow);
+  updateFilterCounts();
+  renderTable();
+  setSummary(currentRun.summary || {});
+  bindDownloads(runId);
+}
+
+function bindDownloads(runId) {
+  downloadButtons.forEach((button) => {
+    const label = button.textContent.trim().replace("↓ ", "").toLowerCase();
+    button.disabled = label !== "json";
+    button.title = label === "json" ? "下载当前结构化结果" : "当前前端结果视图默认生成 JSON；其他格式可通过 CLI 或后端扩展生成";
+    button.onclick = () => {
+      if (label !== "json") {
+        alert("当前页面默认生成 JSON 结果；XLSX / MD / HTML 下载入口可以下一步再补成按需导出。");
+        return;
+      }
+      window.location.href = `${API_BASE}/api/runs/${runId}/download?fmt=json`;
+    };
+  });
+}
+
+document.getElementById("drawer-close").addEventListener("click", closeDrawer);
+document.getElementById("mask").addEventListener("click", closeDrawer);
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeDrawer(); });
+
+document.querySelectorAll(".upload-tabs button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".upload-tabs button").forEach((item) => item.classList.remove("active"));
+    btn.classList.add("active");
+    document.querySelectorAll("[data-pane]").forEach((pane) => { pane.style.display = "none"; });
+    document.querySelector(`[data-pane="${btn.dataset.tab}"]`).style.display = "block";
+  });
+});
+
+filterButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    filterButtons.forEach((item) => item.classList.remove("active"));
+    button.classList.add("active");
+    currentFilter = button.dataset.filter;
+    renderTable();
+  });
+});
+
+["dragenter", "dragover"].forEach((eventName) => drop.addEventListener(eventName, (event) => {
+  event.preventDefault();
+  drop.classList.add("drag");
+}));
+["dragleave", "drop"].forEach((eventName) => drop.addEventListener(eventName, (event) => {
+  event.preventDefault();
+  drop.classList.remove("drag");
+}));
+drop.addEventListener("click", () => fileInput.click());
+drop.addEventListener("drop", (event) => {
+  selectedFile = event.dataTransfer.files[0] || null;
+  if (selectedFile) drop.querySelector(".label").textContent = selectedFile.name;
+});
+fileInput.addEventListener("change", () => {
+  selectedFile = fileInput.files[0] || null;
+  if (selectedFile) drop.querySelector(".label").textContent = selectedFile.name;
+});
+
+window.runDemo = submitRun;
+
+updateFilterCounts();
+renderTable();
+setSummary({});
+setRunMeta(null);
+updatePipeline("queued", "queued");
+</script>
+
+</body>
+</html>

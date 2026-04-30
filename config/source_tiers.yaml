@@ -1,0 +1,104 @@
+# A/B/C 来源分级白名单
+# 详见 docs/05_classifier.md
+# 初始覆盖：两份《低空经济》PDF 中出现的所有来源域名 / 机构名
+
+tiers:
+  A:
+    # 政府 / 监管 / 公报 / 上市公司经审计财报 / 学术核心
+    domain_suffixes:
+      - ".gov.cn"
+      - ".gov"
+      - ".edu.cn"
+      - ".edu"
+      - ".mil"
+    domains:
+      - mot.gov.cn          # 交通运输部 / 民航局《行业发展统计公报》
+      - mee.gov.cn          # 生态环境部
+      - ndrc.gov.cn         # 国家发展改革委
+      - wehdz.gov.cn        # 地方政府转载工信部文件
+      - nanjing.gov.cn      # 地方政府转载文件
+      - baotou.gov.cn       # 地方政府转载文件
+      - caac.gov.cn         # 中国民航局
+      - stats.gov.cn        # 国家统计局
+      - sec.gov             # 美国 SEC
+    name_keywords:
+      - 国务院
+      - 中央军委
+      - 中共中央
+      - 国家发展改革委
+      - 国家发改委
+      - 工信部
+      - 工业和信息化部
+      - 民航局
+      - 中国民航局
+      - 交通运输部
+      - 国家统计局
+      - 市场监管总局
+      - 财政部
+      - 科技部
+      - 政府工作报告
+      - 民航行业发展统计公报
+
+  B:
+    # 主流通讯社 / 头部财经媒体 / 头部券商研报 / 知名咨询 / 上市公司官网披露 / 行业白皮书
+    domains:
+      - news.cn             # 新华网
+      - xinhuanet.com
+      - people.com.cn       # 人民网
+      - caixin.com          # 财新
+      - stcn.com            # 证券时报
+      - stdaily.com         # 科技日报
+      - pdf.dfcfw.com       # 东方财富研报库（券商/机构报告 PDF）
+      - meituan.com         # 美团（上市公司）官网/新闻稿
+      - ehang.com           # 亿航（上市公司）
+      - xiaopeng.com        # 小鹏（上市公司）
+      - dji.com             # 大疆官网
+      - fyuav.cn            # 顺丰丰翼（顺丰体系）
+      - hnacargo.com        # 公开报道引用
+      - sf-express.com      # 顺丰
+      - reuters.com
+      - bloomberg.com
+    name_keywords:
+      - 新华社
+      - 人民日报
+      - 财新
+      - 央视
+      - 路透社
+      - 彭博
+      - 赛迪研究院
+      - 赛迪智库
+      - 赛迪顾问
+      - IDC
+      - Gartner
+      - 来觅研究院
+      - 鲸奇智慧
+      - 中国信通院
+      - CAICT
+      - 农民日报
+      - 白皮书
+
+  # C 为兜底：不命中 A/B 即归 C；同时下列规则强制 C：
+  C_force:
+    fetch_status_failure: true     # 链接 404/timeout/forbidden
+    name_keywords:
+      - 网络资料
+      - 百度百科
+      - 知乎
+      - 个人博客
+      - 自媒体
+
+# 机构名 → 官网域名 映射（Resolver 用）
+institution_to_domain:
+  中国民航局: caac.gov.cn
+  民航局: caac.gov.cn
+  交通运输部: mot.gov.cn
+  国务院: gov.cn
+  工信部: miit.gov.cn
+  国家发改委: ndrc.gov.cn
+  新华社: news.cn
+  美团: meituan.com
+  亿航智能: ehang.com
+  小鹏汇天: xiaopeng.com
+  大疆: dji.com
+  顺丰: sf-express.com
+  丰翼: fyuav.cn
