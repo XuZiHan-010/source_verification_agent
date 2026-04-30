@@ -123,6 +123,35 @@ CMD ["bash", "-c", "python -m market_source_verification_agent.server & python -
 
 两个进程共享 `/app/data/` 和 `/app/cache/` 目录（单机部署），如需扩展到多个 Worker 容器，需将存储后端改为对象存储（见 [config/settings.yaml](config/settings.yaml)）。
 
+### 持久化卷配置
+
+Railway 服务需要持久化卷来存储上传文件和缓存数据。在 Railway 仪表板配置：
+
+1. **创建卷**：Railway 项目 → `source_verification_agent` → **Volumes** → **Add Volume**
+   - **Volume name**: `source-verification-storage`
+
+2. **挂载点**：
+   
+   | 挂载路径 | 用途 |
+   |---|---|
+   | `/app/data` | 上传文件、生成的报告、LLM 缓存 |
+   | `/app/cache` | 爬取的网页内容缓存（可选，也可放在 `/app/data` 下） |
+
+3. **完整的目录结构**：
+   ```
+   /app/data/
+   ├── uploads/       ← 用户上传的 PDF / Word 文件
+   ├── reports/       ← 导出的 xlsx / md / html 报告
+   └── cache/sources/ ← 爬取的网页缓存
+   ```
+
+**推荐配置（单卷方案）**：
+
+- **Volume name**: `source-verification-storage`
+- **Mount path**: `/app/data`
+
+这样 FastAPI 和 Worker 都能共享同一个卷，容器重启或更新后数据不会丢失。
+
 ### 故障排查
 
 - **Worker crash**：检查 `REDIS_URL` 是否包含完整凭证（含密码）
