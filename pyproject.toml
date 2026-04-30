@@ -3,7 +3,6 @@ name = "market-source-verification-agent"
 version = "0.1.0"
 description = "Verify and tier sources cited in market-research tables (PDF/Word/text input)."
 requires-python = ">=3.11"
-readme = "README.md"
 
 dependencies = [
     "openai>=1.0.0",
