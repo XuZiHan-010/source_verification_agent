@@ -12,6 +12,22 @@ from pydantic import BaseModel, Field
 
 # In production (installed via pip), override with PROJECT_ROOT env var to point to /app
 ROOT = Path(os.getenv("PROJECT_ROOT", Path(__file__).resolve().parents[2]))
+_DOTENV_LOADED = False
+
+
+def load_environment() -> None:
+    """Load local .env values without overriding real deployment env vars."""
+
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(ROOT / ".env", override=False)
+    except Exception:
+        pass
 
 
 class ModelSettings(BaseModel):
@@ -43,6 +59,7 @@ class OutputSettings(BaseModel):
 class LimitSettings(BaseModel):
     max_claims_per_run: int = 2000
     per_claim_max_tokens: int = 8000
+    llm_extract_max_calls_per_run: int = 50
 
 
 class StorageSettings(BaseModel):
@@ -118,6 +135,7 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 
 def load_settings(path: str | Path | None = None) -> Settings:
+    load_environment()
     cfg_path = Path(path or os.getenv("MARKET_SOURCE_SETTINGS") or ROOT / "config" / "settings.yaml")
     if not cfg_path.exists():
         return Settings()

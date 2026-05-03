@@ -16,6 +16,7 @@ class Block(BaseModel):
     page: int | None = None
     bbox: tuple[float, float, float, float] | None = None
     hyperlinks: dict[str, str] = Field(default_factory=dict)
+    footnotes: dict[int, str] = Field(default_factory=dict)
 
 
 class IR(BaseModel):
@@ -34,9 +35,14 @@ class Claim(BaseModel):
     statement: str
     source_name_raw: str
     source_url_hint: str | None = None
+    source_urls: list[str] = Field(default_factory=list)
+    extra_source_urls: list[str] = Field(default_factory=list)
+    source_name_with_marks: str | None = None
     publish_time: str | None = None
     notes: str | None = None
     is_forecast: bool = False
+    duplicate_count: int = 1
+    duplicate_claim_ids: list[str] = Field(default_factory=list)
 
 
 class ResolvedSource(BaseModel):
@@ -65,6 +71,7 @@ class VerifyResult(BaseModel):
     evidence_locator: str | None = None
     discrepancy: str | None = None
     reasoning: str
+    source_details: list[dict[str, str | float | None]] = Field(default_factory=list)
 
 
 class ClassifyResult(BaseModel):

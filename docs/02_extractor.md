@@ -56,6 +56,7 @@ def _paragraph_to_claims(text, section_path, llm) -> list[Claim]
 ## 已知坑
 
 - 「来源」列里同时含中文机构名 + 英文域名 + Markdown 链接：保留原文到 `source_name_raw`，把可识别 URL 抽到 `source_url_hint`。
+- 「来源」列末尾的脚注/上标编号会先查 `Block.footnotes`：第一条 URL 写入 `source_url_hint`，其余写入 `extra_source_urls`，去掉编号前的原文保存在 `source_name_raw`，带编号原文保存在 `source_name_with_marks`。
 - 一行多个数值（如 "2024 年累计完成 491 万单和 45 万单"）：拆成多条 Claim。
 - 表格中的「预测值」标记：转移到 `notes`，并设 `is_forecast=true`。
 

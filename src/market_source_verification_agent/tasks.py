@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
@@ -62,6 +63,10 @@ class TaskStore(Protocol):
     def list_artifacts(self, run_id: str, owner_id: str) -> list[Artifact]: ...
 
     def list_runs(self, owner_id: str, limit: int = 20, offset: int = 0) -> list[RunTask]: ...
+
+    def delete_run(self, run_id: str, owner_id: str) -> bool: ...
+
+    def delete_runs(self, owner_id: str) -> int: ...
 
 
 class LocalTaskStore:
@@ -180,6 +185,22 @@ class LocalTaskStore:
         tasks.sort(key=lambda t: t.created_at or datetime.min, reverse=True)
         return tasks[offset : offset + limit]
 
+    def delete_run(self, run_id: str, owner_id: str) -> bool:
+        task = self.get_task(run_id, owner_id)
+        if not task:
+            return False
+        self._remove_run_files(run_id)
+        shutil.rmtree(self._run_dir(run_id), ignore_errors=True)
+        return True
+
+    def delete_runs(self, owner_id: str) -> int:
+        run_ids = [task.run_id for task in self.list_runs(owner_id, limit=100000, offset=0)]
+        deleted = 0
+        for run_id in run_ids:
+            if self.delete_run(run_id, owner_id):
+                deleted += 1
+        return deleted
+
     def _run_dir(self, run_id: str) -> Path:
         return self.root / run_id
 
@@ -191,6 +212,12 @@ class LocalTaskStore:
 
     def _artifacts_path(self, run_id: str) -> Path:
         return self._run_dir(run_id) / "artifacts.json"
+
+    def _remove_run_files(self, run_id: str) -> None:
+        uploads_dir = _abs_path(self.settings.storage.uploads_dir) / run_id
+        reports_dir = _abs_path(self.settings.storage.reports_dir) / run_id
+        shutil.rmtree(uploads_dir, ignore_errors=True)
+        shutil.rmtree(reports_dir, ignore_errors=True)
 
 
 def create_text_input(run_id: str, text: str, settings: Settings) -> Path:

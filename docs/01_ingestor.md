@@ -32,7 +32,7 @@
 }
 ```
 
-关键：**保留原始超链接 / 脚注**。`pdfplumber` 默认不抽超链接 → 用 `pypdf` 或 `PyMuPDF (fitz)` 补抽 annotations。
+关键：**保留原始超链接 / 脚注**。`pdfplumber` 默认不抽超链接 → 用 `PyMuPDF (fitz)` 补抽 annotations；页脚形如 `1 https://...` 的脚注会进入 `Block.footnotes`，供 Extractor 把来源列末尾上标解析为 URL。
 
 ## 关键函数
 
@@ -45,7 +45,7 @@ def _parse_text(text: str) -> IR
 
 ## 已知坑
 
-- PDF 跨页表格：基于「列宽 + 表头是否重复」启发式合并，`merge_cross_page_tables=True` 默认开启。
+- PDF 跨页表格：基于「表头是否重复」启发式合并，续页重复表头会在拼接前丢弃。
 - 合并单元格：`pdfplumber` 返回 `None`，需向上 forward-fill。
 - 中文 PDF 字体嵌入异常 → 行内出现 `(cid:xxx)`：fallback 到 `pdfminer.six` 或调用 OCR（`paddleocr`，可选依赖）。
 - Word 表格嵌套：递归展开，记录嵌套层级在 block 元数据里。

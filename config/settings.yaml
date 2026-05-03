@@ -69,5 +69,6 @@ output:
   include_detail_column: false
 
 limits:
-  max_claims_per_run:   2000
-  per_claim_max_tokens: 8000
+  max_claims_per_run:           2000
+  per_claim_max_tokens:         8000
+  llm_extract_max_calls_per_run: 50    # 仅当 trafilatura/readability/goose3 都失败时才调 LLM 抽取正文，单次 run 全局上限

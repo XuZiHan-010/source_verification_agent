@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from .config import Settings, load_settings
@@ -130,6 +133,44 @@ class MongoTaskStore:
         )
         return [RunTask.model_validate(doc) for doc in docs]
 
+    def delete_run(self, run_id: str, owner_id: str) -> bool:
+        task = self.get_task(run_id, owner_id)
+        if not task:
+            return False
+        self._remove_run_files(task)
+        self.events.delete_many({"run_id": run_id})
+        self.artifacts.delete_many({"run_id": run_id, "owner_id": owner_id})
+        self.runs.delete_one({"run_id": run_id, "owner_id": owner_id})
+        return True
+
+    def delete_runs(self, owner_id: str) -> int:
+        tasks = self.list_runs(owner_id, limit=100000, offset=0)
+        deleted = 0
+        for task in tasks:
+            if self.delete_run(task.run_id, owner_id):
+                deleted += 1
+        return deleted
+
+    def _remove_run_files(self, task: RunTask) -> None:
+        paths = []
+        if task.input_path:
+            paths.append(_path_from_storage_uri(task.input_path))
+        for doc in self.artifacts.find({"run_id": task.run_id, "owner_id": task.owner_id}, {"_id": False}):
+            storage_uri = doc.get("storage_uri")
+            if storage_uri:
+                paths.append(_path_from_storage_uri(storage_uri))
+        for path in paths:
+            if not path:
+                continue
+            try:
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+                    _remove_empty_parent(path.parent)
+                elif path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                continue
+
 
 def _collection(settings: Settings, name: str) -> str:
     return settings.mongodb.collections.get(name, name)
@@ -137,3 +178,25 @@ def _collection(settings: Settings, name: str) -> str:
 
 def _mongo_uri(settings: Settings) -> str | None:
     return os.getenv(settings.mongodb.uri_env) or os.getenv("MONGODB_URL")
+
+
+def _path_from_storage_uri(storage_uri: str) -> Path | None:
+    try:
+        if storage_uri.startswith("file:///"):
+            parsed = urlparse(storage_uri)
+            path = unquote(parsed.path)
+            if parsed.netloc:
+                return Path(f"//{parsed.netloc}{path}")
+            if len(path) >= 4 and path[0] == "/" and path[2] == ":":
+                path = path[1:]
+            return Path(path)
+        return Path(storage_uri)
+    except Exception:
+        return None
+
+
+def _remove_empty_parent(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass

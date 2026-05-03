@@ -14,6 +14,21 @@ from .schema import Block, IR
 Format = Literal["pdf", "docx", "txt", "md", "auto"]
 
 
+# pdfplumber 表格抽取参数：默认参数对中文带合并单元格的表格容易把一个逻辑 cell
+# 切成多个相邻"碎片格"。优先用可见线条划列，避免文字间距被误判为列边界。
+_PDF_TABLE_SETTINGS = {
+    "vertical_strategy": "lines",
+    "horizontal_strategy": "lines",
+    "snap_tolerance": 4,
+    "join_tolerance": 4,
+    "edge_min_length": 12,
+    "intersection_tolerance": 4,
+    "text_tolerance": 3,
+    "text_x_tolerance": 3,
+    "text_y_tolerance": 3,
+}
+
+
 def ingest(path_or_bytes: str | Path | bytes, fmt: Format = "auto", doc_id: str | None = None) -> IR:
     """Parse an input file or text payload into the intermediate representation."""
 
@@ -65,20 +80,59 @@ def _parse_pdf(path: Path, doc_id: str) -> IR:
         raise IngestError("PDF parsing requires pdfplumber and pymupdf", doc_id=doc_id) from exc
 
     blocks: list[Block] = []
-    hyperlinks = _pdf_links(path, fitz)
     try:
-        with pdfplumber.open(path) as pdf:
+        with fitz.open(path) as fitz_doc, pdfplumber.open(path) as pdf:
+            previous_table: Block | None = None
+            previous_header: list[str] | None = None
             for page_idx, page in enumerate(pdf.pages, start=1):
-                page_links = hyperlinks.get(page_idx, {})
-                tables = page.extract_tables() or []
+                fitz_page = fitz_doc[page_idx - 1]
+                page_links = _extract_page_links(fitz_page)
+                footnotes = _extract_page_footnotes(fitz_page, page)
+                tables_lines = page.extract_tables(table_settings=_PDF_TABLE_SETTINGS) or []
+                tables = [table for table in tables_lines if _is_main_table(table)]
+                if not tables:
+                    # fallback：无明显边框的表回退到 pdfplumber 默认（text 策略）
+                    tables = [table for table in page.extract_tables() or [] if _is_main_table(table)]
                 if tables:
                     for table_idx, rows in enumerate(tables):
                         clean_rows = _fill_table(rows)
+                        header = _header_signature(clean_rows)
+                        if (
+                            previous_table
+                            and previous_table.rows is not None
+                            and previous_header
+                            and header
+                            and _headers_match(previous_header, header)
+                        ):
+                            clean_rows = clean_rows[1:]
+                            if clean_rows:
+                                previous_table.rows.extend(clean_rows)
+                                previous_table.footnotes.update(footnotes)
+                            continue
+                        if (
+                            previous_table
+                            and previous_table.rows is not None
+                            and previous_header
+                            and not header
+                            and _is_table_continuation(clean_rows)
+                        ):
+                            previous_table.rows.extend(clean_rows)
+                            previous_table.footnotes.update(footnotes)
+                            continue
                         link_map = {
                             f"{row},{col}": url
                             for (row, col), url in page_links.get(table_idx, {}).items()
                         }
-                        blocks.append(Block(type="table", page=page_idx, rows=clean_rows, hyperlinks=link_map))
+                        block = Block(
+                            type="table",
+                            page=page_idx,
+                            rows=clean_rows,
+                            hyperlinks=link_map,
+                            footnotes=footnotes,
+                        )
+                        blocks.append(block)
+                        previous_table = block
+                        previous_header = header
                 text = page.extract_text() or ""
                 blocks.extend(_text_to_blocks(text, page=page_idx))
     except Exception as exc:  # pragma: no cover - library-specific failures
@@ -97,6 +151,118 @@ def _pdf_links(path: Path, fitz_module) -> dict[int, dict[int, dict[tuple[int, i
     except Exception:
         return {}
     return links
+
+
+def _extract_page_links(page) -> dict[int, dict[tuple[int, int], str]]:
+    urls = [link.get("uri") for link in page.get_links() if link.get("uri")]
+    return {0: {(0, idx): url for idx, url in enumerate(urls)}} if urls else {}
+
+
+def _extract_page_footnotes(page_fitz, page_plumber) -> dict[int, str]:
+    footnotes: dict[int, str] = {}
+    for link in page_fitz.get_links():
+        url = link.get("uri")
+        rect = link.get("from")
+        if not url or rect is None:
+            continue
+        number = _nearest_link_number(page_fitz, rect)
+        if number is not None:
+            footnotes[number] = url
+
+    bottom_text = page_plumber.extract_text() or ""
+    current_number: int | None = None
+    current_url = ""
+    for line in bottom_text.splitlines():
+        stripped = line.strip()
+        match = re.match(r"^(\d{1,3})\s*(https?://\S+)", stripped)
+        if match:
+            if current_number is not None and current_url:
+                footnotes[current_number] = current_url.rstrip(").,;，。")
+            current_number = int(match.group(1))
+            current_url = match.group(2)
+        elif current_number is not None and stripped and re.match(r"^[A-Za-z0-9_./?=&%#:+-]+$", stripped):
+            current_url += stripped
+    if current_number is not None and current_url:
+        footnotes[current_number] = current_url.rstrip(").,;，。")
+    return footnotes
+
+
+def _nearest_link_number(page, rect) -> int | None:
+    try:
+        words = page.get_text("words")
+    except Exception:
+        return None
+    candidates: list[tuple[float, int]] = []
+    for x0, y0, x1, y1, word, *_ in words:
+        if not re.fullmatch(r"\d{1,3}", str(word)):
+            continue
+        if y1 < rect.y0 - 8 or y0 > rect.y1 + 8:
+            continue
+        if x0 > rect.x0 + 4:
+            continue
+        distance = abs(y0 - rect.y0) + max(0.0, rect.x0 - x1)
+        candidates.append((distance, int(word)))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
+
+
+HEADER_KEYWORDS = (
+    "指标",
+    "数值",
+    "年份",
+    "来源",
+    "备注",
+    "驱动因素",
+    "原文表述",
+    "摘要",
+    "差异说明",
+    "缺失信息",
+    "当前状态",
+    "source",
+    "metric",
+    "value",
+    "year",
+    "政策",
+    "法规",
+    "标准",
+    "发布机构",
+    "发布时间",
+    "适用",
+    "核心内容",
+    "监管事项",
+    "具体要求",
+    "适用对象",
+)
+
+
+def _header_signature(rows: list[list[str | None]]) -> list[str] | None:
+    if not rows:
+        return None
+    cells = [_normalise_header_cell(cell) for cell in rows[0]]
+    hits = sum(1 for cell in cells for keyword in HEADER_KEYWORDS if keyword.lower() in cell.lower())
+    return cells if hits >= 2 else None
+
+
+def _headers_match(left: list[str], right: list[str]) -> bool:
+    if not left or not right:
+        return False
+    overlap = sum(1 for a, b in zip(left, right) if a and b and a == b)
+    return overlap >= max(2, min(len(left), len(right)) // 2)
+
+
+def _normalise_header_cell(value: str | None) -> str:
+    return re.sub(r"\s+", "", value or "").strip()
+
+
+def _is_main_table(rows: list[list[str | None]]) -> bool:
+    return any(len(row) >= 4 for row in rows)
+
+
+def _is_table_continuation(rows: list[list[str | None]]) -> bool:
+    if not rows:
+        return False
+    return any(len(row) >= 4 for row in rows) and _header_signature(rows) is None
 
 
 def _parse_docx(path: Path, doc_id: str) -> IR:
@@ -194,8 +360,20 @@ def _fill_table(rows: list[list[str | None]]) -> list[list[str | None]]:
     filled: list[list[str | None]] = []
     previous: list[str | None] = []
     for row in rows:
+        raw = [cell.strip() if isinstance(cell, str) else cell for cell in row]
+        if filled and _is_continuation_row(raw):
+            target = filled[-1]
+            for idx, value in enumerate(raw):
+                if value in ("", None):
+                    continue
+                while idx >= len(target):
+                    target.append(None)
+                target[idx] = f"{target[idx]} {value}".strip() if target[idx] else value
+            previous = target
+            continue
+
         out: list[str | None] = []
-        for idx, cell in enumerate(row):
+        for idx, cell in enumerate(raw):
             value = cell.strip() if isinstance(cell, str) else cell
             if value in ("", None) and idx < len(previous):
                 value = previous[idx]
@@ -203,6 +381,22 @@ def _fill_table(rows: list[list[str | None]]) -> list[list[str | None]]:
         previous = out
         filled.append(out)
     return filled
+
+
+def _is_continuation_row(row: list[str | None]) -> bool:
+    if not any(cell for cell in row):
+        return False
+    if len(row) < 5:
+        return False
+    leading = row[:5]
+    if all(cell in ("", None) for cell in leading):
+        return True
+    # 放宽：前 5 列大部分空，且非空内容是短碎片（典型 PDF 行内换行）
+    leading_empty = sum(1 for cell in leading if cell in ("", None))
+    nonempty = [cell for cell in row if cell]
+    if leading_empty >= 4 and nonempty and all(len(re.sub(r"\s+", "", cell)) <= 6 for cell in nonempty):
+        return True
+    return False
 
 
 def _looks_like_table(text: str) -> bool:

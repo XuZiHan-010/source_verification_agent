@@ -112,6 +112,11 @@ def create_app():
     ):
         return store.list_runs(owner_id, limit=limit, offset=offset)
 
+    @app.delete("/api/runs")
+    def delete_runs(owner_id: Annotated[str, Depends(current_owner)]):
+        deleted = store.delete_runs(owner_id)
+        return {"deleted": deleted}
+
     @app.get("/api/runs/{run_id}")
     def get_run(run_id: str, owner_id: Annotated[str, Depends(current_owner)]):
         task = store.get_task(run_id, owner_id)
@@ -157,6 +162,12 @@ def create_app():
         media_type, _ = mimetypes.guess_type(str(path))
         filename = task.input_filename or path.name
         return FileResponse(path, media_type=media_type or "application/octet-stream", filename=filename)
+
+    @app.delete("/api/runs/{run_id}")
+    def delete_run(run_id: str, owner_id: Annotated[str, Depends(current_owner)]):
+        if not store.delete_run(run_id, owner_id):
+            raise HTTPException(status_code=404, detail="Run not found")
+        return {"deleted": 1, "run_id": run_id}
 
     return app
 

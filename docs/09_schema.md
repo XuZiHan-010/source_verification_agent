@@ -13,6 +13,7 @@ class Block(BaseModel):
     page: int | None = None
     bbox: tuple[float,float,float,float] | None = None
     hyperlinks: dict[str, str] = {}              # "row,col" -> url
+    footnotes: dict[int, str] = {}               # footnote number -> url, per PDF page/table
 
 class IR(BaseModel):
     doc_id: str
@@ -33,6 +34,8 @@ class Claim(BaseModel):
     statement: str                   # 自然语言重述，喂给 Verifier
     source_name_raw: str             # 原文「来源名称」字段
     source_url_hint: str | None      # 抽到的域名/URL 片段；若是完整 URL，Verifier 优先直接打开它读原文
+    extra_source_urls: list[str]      # 同一来源单元格脚注解析出的其余 URL
+    source_name_with_marks: str | None # 去掉脚注标记前的来源原文
     publish_time: str | None
     notes: str | None
     is_forecast: bool = False
