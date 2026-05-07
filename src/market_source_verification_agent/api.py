@@ -105,12 +105,31 @@ def create_app():
             background_tasks.add_task(execute_run, task.run_id, owner_id, store)
         return task
 
+    cleanup_interval_seconds = 3600  # 1 hour
+    last_cleanup_time = {"value": 0}
+
     @app.get("/api/runs")
     def list_runs(
         owner_id: Annotated[str, Depends(current_owner)],
         limit: int = 20,
         offset: int = 0,
     ):
+        """List runs and trigger periodic cleanup."""
+        import time
+
+        from .cleanup import run_cleanup
+
+        # Trigger cleanup every hour in background
+        now = time.time()
+        if now - last_cleanup_time["value"] > cleanup_interval_seconds:
+            last_cleanup_time["value"] = now
+            try:
+                run_cleanup(settings, dry_run=False)
+            except Exception as exc:
+                import logging
+
+                logging.error(f"Background cleanup failed: {exc}")
+
         tasks = store.list_runs(owner_id, limit=limit, offset=offset)
         return [_run_payload(task, store, owner_id) for task in tasks]
 
@@ -174,6 +193,29 @@ def create_app():
         if not store.delete_run(run_id, owner_id):
             raise HTTPException(status_code=404, detail="Run not found")
         return {"deleted": 1, "run_id": run_id}
+
+    @app.get("/api/volume")
+    def get_volume_usage():
+        """Get current volume/disk usage (Railway monitoring)."""
+        from pathlib import Path
+
+        from .cleanup import get_dir_size
+
+        usage = {
+            "cache_mb": get_dir_size(Path(settings.storage.cache_dir if hasattr(settings.storage, "cache_dir") else "data/cache")) / 1024 / 1024,
+            "uploads_mb": get_dir_size(Path(settings.storage.uploads_dir)) / 1024 / 1024,
+            "reports_mb": get_dir_size(Path(settings.storage.reports_dir)) / 1024 / 1024,
+        }
+        usage["total_mb"] = sum(usage.values())
+        usage["warning"] = usage["total_mb"] > 500
+        return usage
+
+    @app.post("/api/cleanup")
+    def manual_cleanup():
+        """Manually trigger cleanup of old runs and cache files."""
+        from .cleanup import run_cleanup
+
+        return run_cleanup(settings)
 
     return app
 
