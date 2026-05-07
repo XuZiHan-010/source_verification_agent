@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import mimetypes
 import shutil
 import threading
@@ -23,6 +24,8 @@ from .config import ROOT, Settings, load_settings
 from .orchestrator import run
 from .schema import Artifact, RunEvent, RunTask
 from .usage import UsageAccumulator, add_persistent_usage, compact_usage_summary, read_persistent_usage
+
+logger = logging.getLogger(__name__)
 
 CONTENT_TYPES = {
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -286,6 +289,7 @@ def execute_run(run_id: str, owner_id: str, store: TaskStore | None = None) -> R
     if task is None:
         raise KeyError(f"run not found: {run_id}")
 
+    logger.info(f"execute_run: starting task {run_id}")
     usage_accumulator = UsageAccumulator()
     usage_lock = threading.Lock()
 
@@ -306,6 +310,7 @@ def execute_run(run_id: str, owner_id: str, store: TaskStore | None = None) -> R
     store.settings.usage_callback = persist_usage
 
     try:
+        logger.info(f"execute_run: updating status to running for {run_id}")
         task.status = "running"
         task.current_stage = "ingest"
         task.started_at = datetime.now()
@@ -317,10 +322,12 @@ def execute_run(run_id: str, owner_id: str, store: TaskStore | None = None) -> R
         }
         store.save_task(task)
         store.add_event(run_id, "running", "info", "Run started")
+        logger.info(f"execute_run: status saved as running for {run_id}")
 
         output_dir = _abs_path(store.settings.storage.reports_dir) / run_id
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"result.{task.requested_format}"
+        logger.info(f"execute_run: starting orchestrator for {run_id}")
         report = run(
             task.input_path or "",
             out_path=output_path,
@@ -328,6 +335,7 @@ def execute_run(run_id: str, owner_id: str, store: TaskStore | None = None) -> R
             config=store.settings,
             detailed=task.detailed,
         )
+        logger.info(f"execute_run: orchestrator completed for {run_id}")
 
         artifact = artifact_from_file(output_path, task.run_id, task.owner_id, task.requested_format)
         store.save_artifact(artifact)
@@ -340,6 +348,7 @@ def execute_run(run_id: str, owner_id: str, store: TaskStore | None = None) -> R
                 store.save_artifact(extra_artifact)
                 artifacts.append(extra_artifact)
 
+        logger.info(f"execute_run: marking as completed for {run_id}")
         task.status = "completed"
         task.current_stage = "completed"
         task.finished_at = datetime.now()
@@ -355,14 +364,17 @@ def execute_run(run_id: str, owner_id: str, store: TaskStore | None = None) -> R
         task.artifact_ids = [item.artifact_id for item in artifacts]
         store.save_task(task)
         store.add_event(run_id, "completed", "info", "Run completed", task.completed_claims, task.total_claims)
+        logger.info(f"execute_run: completed successfully for {run_id}")
         return task
     except Exception as exc:
+        logger.error(f"execute_run: error for {run_id}: {exc}", exc_info=True)
         task.status = "failed"
         task.current_stage = "failed"
         task.error = str(exc)
         task.finished_at = datetime.now()
         store.save_task(task)
         store.add_event(run_id, "failed", "error", str(exc))
+        logger.info(f"execute_run: marked as failed for {run_id}")
         return task
     finally:
         store.settings.usage_callback = original_usage_callback

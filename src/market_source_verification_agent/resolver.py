@@ -651,6 +651,7 @@ def _normalise_url(value: str | None) -> str | None:
         return None
     text = value.strip().strip("<>").strip(" \t\r\n).,;")
     if text.startswith(("http://", "https://")):
+        text = re.sub(r"\s+\d{1,3}\s*$", "", text)
         text = re.sub(r"[\r\n\t\f\v]+", "", text)
         text = re.sub(r"(?<=\S) (?=[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*(?:\d|[/.?&=#%_-]))", "", text)
         return text.strip(" \t\r\n).,;") or None

@@ -211,6 +211,7 @@ def _table_to_claims(
             continue
         if not url_hint and not _is_valid_source_candidate(source_name):
             continue
+        row_footnote_urls = _resolve_row_footnote_urls(cells, block.footnotes)
 
         metric = _get(cells, mapping.metric)
         value = _get(cells, mapping.value)
@@ -222,6 +223,8 @@ def _table_to_claims(
         notes = _join_notes(cells, mapping)
         is_forecast = any("预测" in item or "预计" in item for item in (value, notes, metric) if item)
         statement = _build_statement(metric, value, year, region, cells, mapping)
+        if _looks_like_matrix_table(headers):
+            statement = _build_labeled_row_statement(cells, headers, mapping) or statement
 
         claims.append(
             Claim(
@@ -234,8 +237,8 @@ def _table_to_claims(
                 statement=statement,
                 source_name_raw=source_name,
                 source_url_hint=url_hint,
-                source_urls=_dedupe_urls([url_hint, *footnote_urls[1:]]),
-                extra_source_urls=footnote_urls[1:],
+                source_urls=_dedupe_urls([url_hint, *footnote_urls[1:], *row_footnote_urls]),
+                extra_source_urls=[u for u in _dedupe_urls([*footnote_urls[1:], *row_footnote_urls]) if u != url_hint],
                 source_name_with_marks=raw_source if footnote_urls else None,
                 publish_time=publish_time,
                 notes=notes,
@@ -1146,6 +1149,28 @@ def _build_statement(
     return "；".join(cell for cell in cells if cell and _compact_text(cell) not in SOURCE_NOISE)
 
 
+def _build_labeled_row_statement(cells: list[str], headers: list[str], mapping: HeaderMap) -> str:
+    ignored = {mapping.source, mapping.publish_time}
+    parts: list[str] = []
+    current_label = ""
+    seen = set()
+    for idx, cell in enumerate(cells):
+        header = _clean(headers[idx]) if idx < len(headers) else ""
+        if header:
+            current_label = header
+        if idx in ignored or not cell or _compact_text(cell) in SOURCE_NOISE:
+            continue
+        clean_cell = _clean_statement_part(cell)
+        if not clean_cell or _compact_text(clean_cell) == _compact_text(current_label):
+            continue
+        compact = _compact_text(f"{current_label}:{clean_cell}")
+        if compact in seen:
+            continue
+        seen.add(compact)
+        parts.append(f"{current_label}: {clean_cell}" if current_label else clean_cell)
+    return "；".join(parts)
+
+
 def _clean_statement_part(value: str | None) -> str:
     text = _strip_footnote_url_lines(_clean(value)).strip()
     text = re.sub(r"(?:\s+\d{1,3}){1,10}$", "", text).strip()
@@ -1241,6 +1266,14 @@ def _resolve_row_footnote_source(cells: list[str], footnotes: dict[int, str], ma
     return "", []
 
 
+def _resolve_row_footnote_urls(cells: list[str], footnotes: dict[int, str]) -> list[str]:
+    urls: list[str] = []
+    for cell in cells:
+        _, cell_urls = _resolve_footnote_urls(cell, footnotes)
+        urls.extend(cell_urls)
+    return _dedupe_urls(urls)
+
+
 def _sanitize_source_name(value: str | None) -> str:
     text = _clean(value)
     text = re.sub(r"(?:\s+\d{1,3}){1,12}$", "", text).strip()
@@ -1322,6 +1355,29 @@ def _extract_urls(text: str | None) -> list[str]:
     return _dedupe_urls(urls)
 
 
+def _resolve_claim_id_source_cell(cell_text: str, footnotes: dict[int, str]) -> tuple[str, list[str]]:
+    text = (cell_text or "").strip()
+    if not text:
+        return "", []
+
+    clean_text = text
+    footnote_urls: list[str] = []
+    trailing_match = re.search(r"(?:\s+\d{1,3}){1,8}\s*$", text)
+    if trailing_match:
+        numbers = [int(item) for item in re.findall(r"\d{1,3}", trailing_match.group(0))]
+        matched_urls = [footnotes[number] for number in numbers if number in footnotes]
+        if matched_urls:
+            clean_text = text[: trailing_match.start()].strip()
+            footnote_urls = matched_urls
+
+    visible_urls = _extract_urls(clean_text)
+    urls = _dedupe_urls([*footnote_urls, *visible_urls])
+    if urls:
+        return clean_text, urls
+
+    return text, _extract_urls(text)
+
+
 def _scan_url_at(text: str, start: int) -> str:
     chars: list[str] = []
     idx = start
@@ -1352,6 +1408,8 @@ def _next_nonspace_segment(text: str, start: int) -> str:
 def _looks_like_wrapped_url_segment(segment: str) -> bool:
     if not segment or segment.startswith(("http://", "https://")):
         return False
+    if re.fullmatch(r"\d{1,3}", segment):
+        return False
     if not _URL_SAFE_SEGMENT_RE.fullmatch(segment):
         return False
     return bool(re.search(r"[/.?&=#%_-]|\d", segment) or len(segment) <= 4)
@@ -1364,6 +1422,7 @@ def _normalize_source_url(value: str | None) -> str | None:
     if not text:
         return None
     if text.startswith(("http://", "https://")):
+        text = re.sub(r"\s+\d{1,3}\s*$", "", text)
         text = re.sub(r"[\r\n\t\f\v]+", "", text)
         text = re.sub(r"(?<=\S) (?=[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*(?:\d|[/.?&=#%_-]))", "", text)
     return text.strip(_URL_TRAILING_CHARS) or None
@@ -1697,16 +1756,17 @@ def _claim_id_table_to_claims(
         # （pdfplumber 跨行列对齐有时错位，URL 可能跑到隔壁列）
         source_cell = row[source_url_col] if source_url_col < len(row) else ""
         source_cell = (source_cell or "").strip()
-        urls = _extract_urls(source_cell)
+        clean_source_cell, urls = _resolve_claim_id_source_cell(source_cell, block.footnotes)
         url_source_col = source_url_col
         if not urls:
             for col_idx in range(len(row)):
                 if col_idx == claim_id_col:
                     continue
                 cand = (row[col_idx] or "").strip()
-                found = _extract_urls(cand)
+                clean_cand, found = _resolve_claim_id_source_cell(cand, block.footnotes)
                 if found:
                     source_cell = cand
+                    clean_source_cell = clean_cand
                     urls = found
                     url_source_col = col_idx
                     break
@@ -1741,7 +1801,7 @@ def _claim_id_table_to_claims(
         statement = "；".join(statement_parts) or cid
 
         # source_name 用 URL 域名兜底（reporter 显示用）
-        source_name_raw = source_cell or urls[0]
+        source_name_raw = clean_source_cell or source_cell or urls[0]
 
         claims.append(
             Claim(

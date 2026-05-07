@@ -71,8 +71,15 @@ def verify(
             confidence=0.2,
             reasoning="no source passage mentions the claim keywords",
         )
-    # 注：旧的 _all_fallback_passages 跳过 LLM 的快速通道已移除——
-    # 新格式 claim 是任意文本陈述，BM25 字符 bigram 经常无强命中，必须给 LLM 兜底机会做语义判断。
+    if _all_fallback_passages(passages) and not claim.original_columns:
+        return VerifyResult(
+            claim_id=claim.claim_id,
+            verdict="not_found",
+            confidence=0.15,
+            reasoning="LLM skipped because lexical retrieval found no claim keyword signal",
+        )
+
+    # 新格式 claim 是任意文本陈述，BM25 字符 bigram 经常无强命中，仍给 LLM 兜底机会做语义判断。
     # strict 数值快路径仍保留：如果 fast 命中则直接返回 supported（数值类 PDF 无 token 成本）。
 
     # Layer 1: rules fast path — only fires for unambiguous exact matches.

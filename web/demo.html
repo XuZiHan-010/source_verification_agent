@@ -2122,21 +2122,55 @@ async function submitRun() {
 }
 
 async function pollRun(runId) {
+  const maxWaitMs = 10 * 60 * 1000; // 10 minutes max
+  const startTime = Date.now();
+  const pollIntervalMs = 1200;
+  let noProgressCount = 0;
+  const maxNoProgress = 20; // 24 seconds without status change
+
   while (true) {
-    const response = await fetchWithAuth(`${API_BASE}/api/runs/${runId}`);
-    if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    currentRun = payload.run;
-    setRunMeta(currentRun);
-    updatePipeline(currentRun.current_stage, currentRun.status);
-    if (currentRun.status === "completed") {
-      await loadResult(runId);
-      return;
+    if (Date.now() - startTime > maxWaitMs) {
+      throw new Error("任务超时（超过10分钟）");
     }
-    if (currentRun.status === "failed") {
-      throw new Error(currentRun.error || "任务执行失败");
+
+    try {
+      const response = await fetchWithAuth(`${API_BASE}/api/runs/${runId}`);
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      const prevStatus = currentRun?.status;
+      currentRun = payload.run;
+      setRunMeta(currentRun);
+      updatePipeline(currentRun.current_stage, currentRun.status);
+
+      // Reset counter if status changed
+      if (currentRun.status !== prevStatus) {
+        noProgressCount = 0;
+      } else {
+        noProgressCount++;
+        if (noProgressCount > maxNoProgress && currentRun.status === "running") {
+          console.warn(`No progress for ${noProgressCount * 1.2}s on stage ${currentRun.current_stage}`);
+        }
+      }
+
+      if (currentRun.status === "completed") {
+        await loadResult(runId);
+        return;
+      }
+      if (currentRun.status === "failed") {
+        throw new Error(currentRun.error || "任务执行失败");
+      }
+    } catch (err) {
+      console.error("轮询错误:", err.message);
+      throw err;
     }
-    await new Promise((resolve) => setTimeout(resolve, 1200));
+
+    // Exponential backoff for long-running tasks
+    const elapsedMs = Date.now() - startTime;
+    const dynamicInterval = Math.min(
+      Math.max(pollIntervalMs, pollIntervalMs * Math.pow(1.05, elapsedMs / 30000)),
+      5000 // max 5 seconds
+    );
+    await new Promise((resolve) => setTimeout(resolve, dynamicInterval));
   }
 }
 
