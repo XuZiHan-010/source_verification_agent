@@ -40,7 +40,7 @@ Claim.source_url_hint / ResolvedSource.url
    ├─▶ 检索 top-k 块 (BM25 → 阈值低再 fallback embedding)
    │       检索 query = metric + value + year + 关键名词
    └─▶ LLM 判定
-          model: gpt-5-mini
+          model: gpt-4o-mini
           system: 见 08_config_prompts.md#verifier-system
           input: claim 结构化字段 + top-k 块原文
           output: VerifyResult JSON

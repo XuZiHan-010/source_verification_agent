@@ -15,6 +15,7 @@ import httpx
 
 from .config import ROOT, Settings, load_source_tiers
 from .schema import Claim, ResolvedSource
+from .usage import record_openai_usage
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,23 @@ _NAV_KEYWORDS = (
 _MIN_GOOD_LENGTH = 200
 _MAX_NAV_RATIO = 0.30
 _MIN_GOOD_PARAGRAPHS = 3
+# Reject suspiciously small response bodies: real PDFs are at least a few KB,
+# real HTML pages have at least a few hundred bytes of markup. Anything below
+# is almost always an anti-bot stub, login redirect, or empty CDN error.
+_MIN_PDF_BYTES = 1024
+_MIN_HTML_BYTES = 256
+_MAIN_CONTENT_SELECTORS = (
+    "#UCAP-CONTENT",
+    ".pages_content",
+    ".trs_editor_view",
+    "article",
+    ".article",
+    ".article-content",
+    ".content",
+    ".content-main",
+    "#content",
+    "#main",
+)
 
 
 # ── LLM extract budget (per process) ─────────────────────────────────────────
@@ -137,33 +155,50 @@ def _fetch_and_cache(url: str, settings: Settings) -> dict[str, str | None]:
     cache_path = cache_dir / f"{url_hash}{suffix}"
     meta = {"status": "ok", "path": str(cache_path), "content_type": "pdf" if suffix == ".pdf" else "html", "hash": None, "title": None}
 
+    min_bytes = _MIN_PDF_BYTES if suffix == ".pdf" else _MIN_HTML_BYTES
+
     if cache_path.exists():
         body = cache_path.read_bytes()
-        meta["hash"] = hashlib.sha256(body).hexdigest()
-        meta["title"] = _extract_title(body.decode("utf-8", errors="ignore"))
-        return meta
+        # Don't honor a previously-cached empty/truncated file — re-fetch.
+        if len(body) >= min_bytes:
+            meta["hash"] = hashlib.sha256(body).hexdigest()
+            meta["title"] = _extract_title(body.decode("utf-8", errors="ignore"))
+            return meta
+        try:
+            cache_path.unlink()
+        except OSError:
+            pass
 
-    direct = _http_get_with_retry(url)
+    direct = _http_get_with_retry(url, min_body_bytes=min_bytes)
     if direct["status"] == "ok":
-        return _persist(direct["body"], direct["content_type_header"], cache_path, suffix, meta)
+        persisted = _persist(direct["body"], direct["content_type_header"], cache_path, suffix, meta)
+        if persisted is not None:
+            return persisted
+        direct = {**direct, "status": "empty_body"}
 
-    # Archive.org mirror fallback for forbidden/timeout/5xx HTML pages.
-    if suffix == ".html" and direct["status"] in {"forbidden", "timeout", "server_error"}:
-        archived = _http_get_with_retry(_archive_url(url), max_attempts=2)
+    # Archive.org mirror fallback for forbidden/timeout/5xx/empty HTML pages.
+    if suffix == ".html" and direct["status"] in {"forbidden", "timeout", "server_error", "empty_body"}:
+        archived = _http_get_with_retry(_archive_url(url), max_attempts=2, min_body_bytes=min_bytes)
         if archived["status"] == "ok":
             persisted = _persist(archived["body"], archived["content_type_header"], cache_path, suffix, meta)
-            persisted["mirror"] = "archive.org"
-            return persisted
+            if persisted is not None:
+                persisted["mirror"] = "archive.org"
+                return persisted
 
-    meta["status"] = direct["status"] if direct["status"] != "server_error" else "forbidden"
-    if meta["status"] == "404":
-        meta["path"] = None
-    else:
-        meta["path"] = None
+    status = direct["status"]
+    if status == "server_error":
+        status = "forbidden"
+    meta["status"] = status
+    meta["path"] = None
     return meta
 
 
-def _persist(body: bytes, content_type_header: str, cache_path: Path, suffix: str, meta: dict) -> dict:
+def _persist(body: bytes, content_type_header: str, cache_path: Path, suffix: str, meta: dict) -> dict | None:
+    # Defensive guard: never write 0-byte (or near-empty) files. Callers treat
+    # None as "fetch produced nothing usable" and fall back to empty_body.
+    min_bytes = _MIN_PDF_BYTES if suffix == ".pdf" else _MIN_HTML_BYTES
+    if not body or len(body) < min_bytes:
+        return None
     cache_path.write_bytes(body)
     is_pdf = "pdf" in (content_type_header or "").lower() or suffix == ".pdf"
     meta["content_type"] = "pdf" if is_pdf else "html"
@@ -176,8 +211,8 @@ def _persist(body: bytes, content_type_header: str, cache_path: Path, suffix: st
     return meta
 
 
-def _http_get_with_retry(url: str, max_attempts: int = 3) -> dict:
-    """GET with browser UA, exponential backoff, and UA swap on 403/429."""
+def _http_get_with_retry(url: str, max_attempts: int = 3, min_body_bytes: int = 1) -> dict:
+    """GET with browser UA, exponential backoff, and UA swap on 403/429/empty body."""
     last_status = "timeout"
     headers = dict(_DEFAULT_HEADERS)
     for attempt in range(max_attempts):
@@ -186,14 +221,26 @@ def _http_get_with_retry(url: str, max_attempts: int = 3) -> dict:
                 response = client.get(url)
             status_code = response.status_code
             if status_code == 200:
-                return {
-                    "status": "ok",
-                    "body": response.content,
-                    "content_type_header": response.headers.get("content-type", ""),
-                }
-            if status_code == 404:
+                body = response.content
+                if len(body) >= min_body_bytes:
+                    return {
+                        "status": "ok",
+                        "body": body,
+                        "content_type_header": response.headers.get("content-type", ""),
+                    }
+                # HTTP 200 but body too small — likely anti-bot stub or login
+                # redirect. Treat as soft failure and swap UA before retrying.
+                logger.debug(
+                    "empty/truncated body for %s (got %d bytes, need %d) — retrying with UA swap",
+                    url, len(body), min_body_bytes,
+                )
+                last_status = "empty_body"
+                headers["User-Agent"] = (
+                    _BROWSER_UA_FALLBACK if headers["User-Agent"] == _BROWSER_UA_PRIMARY else _BROWSER_UA_PRIMARY
+                )
+            elif status_code == 404:
                 return {"status": "404", "body": b"", "content_type_header": ""}
-            if status_code in {401, 403, 429}:
+            elif status_code in {401, 403, 429}:
                 last_status = "forbidden"
                 # UA swap once
                 headers["User-Agent"] = _BROWSER_UA_FALLBACK if headers["User-Agent"] == _BROWSER_UA_PRIMARY else _BROWSER_UA_PRIMARY
@@ -224,15 +271,63 @@ def load_cached_source_text(source: ResolvedSource, settings: Settings | None = 
     if not path.exists():
         return ""
     if source.content_type == "pdf":
-        try:
-            import pdfplumber
-
-            with pdfplumber.open(path) as pdf:
-                return "\n".join(page.extract_text() or "" for page in pdf.pages)
-        except Exception:
-            return ""
+        text, diag = _extract_pdf_text(path)
+        if not text.strip():
+            logger.warning("pdf text extraction empty for %s: %s", path, diag)
+        return text
     raw = path.read_text(encoding="utf-8", errors="ignore")
     return _extract_html_main(raw, source.url or "", settings or Settings())
+
+
+def _extract_pdf_text(path: Path) -> tuple[str, str]:
+    """Extract text from a cached PDF, returning (text, diagnostic_message).
+
+    The diagnostic distinguishes the common failure modes (encrypted, no text
+    layer, wrong magic bytes, parse error) so the verifier can surface a
+    specific reason instead of a generic "extraction empty".
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return "", f"stat failed: {exc}"
+    if size == 0:
+        return "", "cache file is empty (0 bytes)"
+
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(8)
+    except OSError as exc:
+        return "", f"read failed: {exc}"
+    if not head.startswith(b"%PDF"):
+        snippet = head[:8].hex()
+        return "", f"not a PDF (magic bytes={snippet}); upstream may have served HTML or an error page"
+
+    try:
+        import pdfplumber
+    except ImportError as exc:
+        return "", f"pdfplumber not available: {exc}"
+
+    try:
+        with pdfplumber.open(path) as pdf:
+            page_count = len(pdf.pages)
+            page_texts = [page.extract_text() or "" for page in pdf.pages]
+    except Exception as exc:  # pdfplumber raises a wide variety of errors
+        return "", f"pdfplumber.open failed ({type(exc).__name__}: {exc})"
+
+    text = "\n".join(page_texts)
+    if text.strip():
+        return text, "ok"
+    pages_with_text = sum(1 for t in page_texts if t.strip())
+    return "", (
+        f"all {page_count} pages returned empty text "
+        f"(pages_with_text={pages_with_text}); likely scanned/image-only PDF — OCR not enabled"
+    )
+
+
+def diagnose_cached_pdf(path: Path) -> str:
+    """Public helper: return the diagnostic message for a cached PDF path."""
+    _, diag = _extract_pdf_text(path)
+    return diag
 
 
 # ── Multi-extractor voting + LLM fallback ────────────────────────────────────
@@ -243,40 +338,103 @@ def _extract_html_main(html: str, url: str, settings: Settings) -> str:
 
     candidates: list[tuple[str, float, str]] = []  # (text, score, source_name)
 
-    # 1. trafilatura
+    # 1. Site/content-container extraction catches government pages that generic
+    # extractors sometimes reduce to a header link.
+    text = _try_structured_main_content(html)
+    if text:
+        candidates.append((text, _score_extraction(text), "structured"))
+
+    # 2. trafilatura
     text = _try_trafilatura(html)
     if text:
         candidates.append((text, _score_extraction(text), "trafilatura"))
 
-    # 2. readability-lxml
+    # 3. readability-lxml
     text = _try_readability(html)
     if text:
         candidates.append((text, _score_extraction(text), "readability"))
 
-    # 3. goose3
+    # 4. goose3
     text = _try_goose3(html, url)
     if text:
         candidates.append((text, _score_extraction(text), "goose3"))
 
     # Pick best from algorithmic extractors
     best = max(candidates, key=lambda item: item[1], default=None)
-    if best and best[1] >= 1.0:
+    if best and _is_usable_extraction(best[0], best[1]):
         return best[0]
 
-    # 4. LLM fallback (only when budget remains and algorithmic results are weak)
+    # 5. LLM fallback (only when budget remains and algorithmic results are weak)
     if _llm_extract_budget_remaining(settings):
         llm_text = _try_llm_extract(html, settings)
         if llm_text:
             llm_score = _score_extraction(llm_text)
-            if best is None or llm_score > best[1]:
+            if _is_usable_extraction(llm_text, llm_score) and (best is None or llm_score > best[1]):
                 return llm_text
-            return best[0]
 
-    if best and best[0]:
+    # Last-resort regex strip. Prefer it over a low-quality extractor result,
+    # because a short nav/header snippet is worse than a noisy full-page body.
+    stripped = _strip_html(html)
+    stripped_score = _score_extraction(stripped)
+    if _is_usable_extraction(stripped, stripped_score) and (best is None or stripped_score > best[1]):
+        return stripped
+
+    if best and best[0] and not _looks_like_nav_only(best[0]):
         return best[0]
+    return stripped
 
-    # Last-resort regex strip
-    return _strip_html(html)
+
+def _try_structured_main_content(html: str) -> str:
+    try:
+        from bs4 import BeautifulSoup
+
+        candidates: list[tuple[str, float]] = []
+        for parser in ("lxml", "html.parser"):
+            soup = BeautifulSoup(html, parser)
+            for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form", "noscript", "svg", "iframe"]):
+                tag.decompose()
+
+            for selector in _MAIN_CONTENT_SELECTORS:
+                for node in soup.select(selector):
+                    text = _node_text(node)
+                    if text:
+                        candidates.append((text, _score_extraction(text)))
+
+            if candidates:
+                break
+
+        if not candidates:
+            return ""
+        text, score = max(candidates, key=lambda item: item[1])
+        return text if _is_usable_extraction(text, score) else ""
+    except Exception as exc:
+        logger.debug("structured HTML extraction failed: %s", exc)
+        return ""
+
+
+def _node_text(node) -> str:
+    for tag in node.find_all(["br"]):
+        tag.replace_with("\n")
+    for tag in node.find_all(["p", "div", "li", "tr", "h1", "h2", "h3", "h4"]):
+        tag.append("\n")
+    return re.sub(r"\n{3,}", "\n\n", node.get_text("\n", strip=True)).strip()
+
+
+def _is_usable_extraction(text: str, score: float | None = None) -> bool:
+    text = (text or "").strip()
+    if not text or _looks_like_nav_only(text):
+        return False
+    return (score if score is not None else _score_extraction(text)) >= 1.0
+
+
+def _looks_like_nav_only(text: str) -> bool:
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    if not compact:
+        return True
+    if len(compact) <= 120 and re.fullmatch(r"https?://[^\s]+/?", compact):
+        return True
+    nav_hits = sum(1 for keyword in _NAV_KEYWORDS if keyword in compact)
+    return len(compact) <= 180 and nav_hits >= 3
 
 
 def _score_extraction(text: str) -> float:
@@ -346,7 +504,7 @@ def _try_llm_extract(html: str, settings: Settings) -> str:
         if not cleaned.strip():
             return ""
 
-        model = getattr(settings.models, "extractor", "gpt-5-mini")
+        model = getattr(settings.models, "extractor", "gpt-4o-mini")
         client = OpenAI()
         response = client.chat.completions.create(
             model=model,
@@ -356,6 +514,7 @@ def _try_llm_extract(html: str, settings: Settings) -> str:
             ],
             max_completion_tokens=4000,
         )
+        record_openai_usage(settings, model, response)
         _llm_extract_consume()
         return (response.choices[0].message.content or "").strip()
     except Exception as exc:

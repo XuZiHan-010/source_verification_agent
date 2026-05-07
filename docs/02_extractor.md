@@ -62,4 +62,4 @@ def _paragraph_to_claims(text, section_path, llm) -> list[Claim]
 
 ## 依赖
 
-`openai` (`gpt-5-mini`，单次 ≤ 50 行成本可控)，`pydantic`（schema 校验）。
+`openai` (`gpt-4o-mini`，单次 ≤ 50 行成本可控)，`pydantic`（schema 校验）。

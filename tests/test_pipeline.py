@@ -1,7 +1,7 @@
 import pytest
 
 from market_source_verification_agent import classifier, extractor, ingestor, reporter
-from market_source_verification_agent.schema import ClassifyResult, ResolvedSource, VerifyResult
+from market_source_verification_agent.schema import Claim, ClassifyResult, ResolvedSource, VerifyResult
 
 
 def test_markdown_table_pipeline_renders_json():
@@ -63,6 +63,27 @@ def test_classifier_matches_government_suffix():
     result = classifier.classify(source, claim)
 
     assert result.tier == "A"
+
+
+def test_classifier_matches_government_apex_suffix():
+    claim = Claim(claim_id="c1", statement="test", source_name_raw="中国政府网")
+    source = ResolvedSource(
+        claim_id=claim.claim_id,
+        resolution_method="whitelist",
+        url="https://www.gov.cn",
+        domain="gov.cn",
+        title=None,
+        fetch_status="ok",
+        local_cache_path=None,
+        content_type="html",
+        content_hash=None,
+    )
+    tiers = {"tiers": {"A": {"domain_suffixes": [".gov.cn"]}}}
+
+    result = classifier.classify(source, claim, tiers)
+
+    assert result.tier == "A"
+    assert result.matched_rule == "suffix:A:.gov.cn"
 
 
 def test_xlsx_render_writes_bytes():

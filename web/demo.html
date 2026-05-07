@@ -739,6 +739,56 @@
     background: rgba(59,130,246,.22);
     color: #fff;
   }
+  .nav-usage {
+    margin-left: auto;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(116px, auto));
+    gap: 8px;
+    align-items: stretch;
+  }
+  .usage-tile {
+    position: relative;
+    min-height: 42px;
+    padding: 7px 12px 7px 14px;
+    border: 1px solid rgba(96,165,250,.24);
+    border-radius: 12px;
+    background:
+      linear-gradient(135deg, rgba(59,130,246,.12), rgba(15,23,42,.74)),
+      radial-gradient(circle at 100% 0%, rgba(52,211,153,.16), transparent 48%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 12px 28px rgba(0,0,0,.22);
+    overflow: hidden;
+  }
+  .usage-tile::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 8px;
+    bottom: 8px;
+    width: 2px;
+    border-radius: 999px;
+    background: var(--accent-2);
+    box-shadow: 0 0 14px rgba(96,165,250,.7);
+  }
+  .usage-label {
+    display: block;
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: .12em;
+    color: var(--text-3);
+    text-transform: uppercase;
+  }
+  .usage-value {
+    display: block;
+    margin-top: 2px;
+    font-family: var(--mono);
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: -.02em;
+  }
+  .usage-value.cost {
+    color: var(--ok);
+  }
 
   main {
     max-width: 1480px;
@@ -1274,6 +1324,11 @@
       width: 100%;
       justify-content: flex-start;
     }
+    .nav-usage {
+      width: 100%;
+      grid-template-columns: 1fr 1fr;
+      margin-left: 0;
+    }
     .nav .auth-section input {
       width: min(64vw, 360px);
     }
@@ -1394,6 +1449,16 @@
     <label for="apiKeyInput">密钥</label>
     <input type="password" id="apiKeyInput" placeholder="输入密钥" />
     <button class="nav-hist-btn" onclick="openHistory()">历史记录</button>
+  </div>
+  <div class="nav-usage" aria-label="OpenAI token usage">
+    <div class="usage-tile">
+      <span class="usage-label">Tokens</span>
+      <span class="usage-value" id="usageTokens">0</span>
+    </div>
+    <div class="usage-tile">
+      <span class="usage-label">Est. Cost</span>
+      <span class="usage-value cost" id="usageCost">$0.0000</span>
+    </div>
   </div>
 </nav>
 
@@ -1608,6 +1673,8 @@ const pasteArea = document.querySelector("textarea.paste");
 const fileRunButton = document.querySelector('[data-pane="file"] .btn-primary');
 const textRunButton = document.querySelector('[data-pane="paste"] .btn-primary');
 const filterButtons = Array.from(document.querySelectorAll(".filter-pill"));
+const usageTokensEl = document.getElementById("usageTokens");
+const usageCostEl = document.getElementById("usageCost");
 const downloadButtons = Array.from(document.querySelectorAll(".download-group button"));
 
 function escapeHtml(value) {
@@ -1832,12 +1899,44 @@ function updatePipeline(stage = "queued", status = "queued") {
   });
 }
 
+function updateUsageMeter(run) {
+  const usage = run?.global_usage || run?.summary?.global_usage || run?.usage || run?.summary?.usage || {};
+  const totalTokens = Number(usage.total_tokens || 0);
+  const cost = Number(usage.estimated_cost_usd ?? run?.cost_usd ?? run?.summary?.cost_usd ?? 0);
+  usageTokensEl.textContent = formatCount(totalTokens);
+  usageCostEl.textContent = formatUsd(cost);
+  usageTokensEl.title = `输入 ${formatCount(usage.input_tokens || 0)} · 缓存输入 ${formatCount(usage.cached_input_tokens || 0)} · 输出 ${formatCount(usage.output_tokens || 0)}`;
+  usageCostEl.title = "按 OpenAI 当前 gpt-4o-mini 文本价格估算：输入 $0.15/1M，缓存输入 $0.075/1M，输出 $0.60/1M";
+}
+
+async function refreshGlobalUsage() {
+  try {
+    const response = await fetchWithAuth(`${API_BASE}/api/usage`);
+    if (!response.ok) return;
+    updateUsageMeter({ global_usage: await response.json() });
+  } catch (_) {
+    // Usage display is helpful but should never block the main workflow.
+  }
+}
+
+function formatCount(value) {
+  return new Intl.NumberFormat("zh-CN").format(Math.max(0, Math.round(Number(value) || 0)));
+}
+
+function formatUsd(value) {
+  const amount = Number(value) || 0;
+  if (amount === 0) return "$0.0000";
+  if (amount < 0.0001) return `$${amount.toFixed(6)}`;
+  return `$${amount.toFixed(4)}`;
+}
+
 function setRunMeta(run) {
   const meta = document.querySelector(".hero .corner-meta");
   if (!run) {
     meta.innerHTML = `<span><b>0</b> 条声明</span><span>↳ <b>0/0</b> 已结算</span><span>状态 <b>空闲</b></span>`;
     return;
   }
+  updateUsageMeter(run);
   const statusLabel = { completed: "已完成", running: "运行中", queued: "排队中", failed: "失败" }[run.status] || run.status;
   meta.innerHTML = `
     <span><b>${run.total_claims || 0}</b> 条声明</span>
@@ -1998,6 +2097,7 @@ const storedApiKey = localStorage.getItem("apiKey");
 if (storedApiKey) {
   document.getElementById("apiKeyInput").value = storedApiKey;
 }
+refreshGlobalUsage();
 
 // ─────────── History panel ───────────
 
@@ -2055,7 +2155,7 @@ function renderHistory(runs) {
     const filename = run.input_filename || (run.input_kind === "text" ? "粘贴文本" : "未知文件");
     const shortId = (run.run_id || "").slice(0, 8).toUpperCase();
     const claimsText = run.total_claims != null ? `${run.completed_claims ?? 0}/${run.total_claims} 条声明` : "";
-    const canView = run.status === "completed";
+    const canView = run.status === "completed" && run.result_available !== false;
     return `
       <div class="hist-run" data-run-id="${escapeHtml(run.run_id)}">
         <div class="hist-run-head" onclick="histViewRun('${escapeHtml(run.run_id)}', ${canView})">
@@ -2115,7 +2215,10 @@ async function histClearAll() {
 }
 
 async function histViewRun(runId, canView) {
-  if (!canView) return;
+  if (!canView) {
+    alert("这条历史记录的结果文件已经不在本地，请重新运行。");
+    return;
+  }
   closeHistory();
   setBusy(true, "加载历史结果…");
   currentRows = [];

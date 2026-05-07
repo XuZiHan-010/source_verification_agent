@@ -60,4 +60,4 @@
 
 ## 技术栈
 
-Python 3.11+ · FastAPI · Redis/RQ · MongoDB Atlas（Motor/PyMongo）· OpenAI SDK（gpt-5-mini 抽取 / 核验 / 分类）· pdfplumber · python-docx · httpx · BeautifulSoup · pandas · openpyxl
+Python 3.11+ · FastAPI · Redis/RQ · MongoDB Atlas（Motor/PyMongo）· OpenAI SDK（gpt-4o-mini 抽取 / 核验 / 分类）· pdfplumber · python-docx · httpx · BeautifulSoup · pandas · openpyxl

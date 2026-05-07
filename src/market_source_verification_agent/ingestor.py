@@ -137,6 +137,12 @@ def _parse_pdf(path: Path, doc_id: str) -> IR:
                 blocks.extend(_text_to_blocks(text, page=page_idx))
     except Exception as exc:  # pragma: no cover - library-specific failures
         raise IngestError(str(exc), doc_id=doc_id) from exc
+
+    # 最后，对所有表格Block进行列数规范化（处理多表合并导致的不一致）
+    for block in blocks:
+        if block.type == "table" and block.rows:
+            block.rows = _normalize_table_columns(block.rows)
+
     return IR(doc_id=doc_id, source_format="pdf", blocks=blocks)
 
 
@@ -158,6 +164,32 @@ def _extract_page_links(page) -> dict[int, dict[tuple[int, int], str]]:
     return {0: {(0, idx): url for idx, url in enumerate(urls)}} if urls else {}
 
 
+_SUPERSCRIPT_TO_ASCII = str.maketrans(
+    {
+        "⁰": "0",
+        "¹": "1",
+        "²": "2",
+        "³": "3",
+        "⁴": "4",
+        "⁵": "5",
+        "⁶": "6",
+        "⁷": "7",
+        "⁸": "8",
+        "⁹": "9",
+        # Some PDF text extractors surface UTF-8 superscript 1/2/3 bytes as
+        # GBK-looking Chinese characters. Treat them as the same footnote marks.
+        "鹿": "1",
+        "虏": "2",
+        "鲁": "3",
+    }
+)
+
+
+def _normalize_footnote_number(text: str) -> str:
+    """Convert superscript digits (¹²³…) to plain ASCII digits."""
+    return text.translate(_SUPERSCRIPT_TO_ASCII)
+
+
 def _extract_page_footnotes(page_fitz, page_plumber) -> dict[int, str]:
     footnotes: dict[int, str] = {}
     for link in page_fitz.get_links():
@@ -174,7 +206,11 @@ def _extract_page_footnotes(page_fitz, page_plumber) -> dict[int, str]:
     current_url = ""
     for line in bottom_text.splitlines():
         stripped = line.strip()
-        match = re.match(r"^(\d{1,3})\s*(https?://\S+)", stripped)
+        # Normalise any leading superscript digits to ASCII before matching.
+        normalised = _normalize_footnote_number(stripped)
+        # Allow zero or more spaces between the footnote number and the URL
+        # (e.g. "¹http://..." normalises to "1http://..." with no space).
+        match = re.match(r"^(\d{1,3})\s*(https?://\S+)", normalised)
         if match:
             if current_number is not None and current_url:
                 footnotes[current_number] = current_url.rstrip(").,;，。")
@@ -194,14 +230,15 @@ def _nearest_link_number(page, rect) -> int | None:
         return None
     candidates: list[tuple[float, int]] = []
     for x0, y0, x1, y1, word, *_ in words:
-        if not re.fullmatch(r"\d{1,3}", str(word)):
+        normalised = _normalize_footnote_number(str(word))
+        if not re.fullmatch(r"\d{1,3}", normalised):
             continue
         if y1 < rect.y0 - 8 or y0 > rect.y1 + 8:
             continue
         if x0 > rect.x0 + 4:
             continue
         distance = abs(y0 - rect.y0) + max(0.0, rect.x0 - x1)
-        candidates.append((distance, int(word)))
+        candidates.append((distance, int(normalised)))
     if not candidates:
         return None
     return min(candidates, key=lambda item: item[0])[1]
@@ -357,6 +394,7 @@ def _parse_markdown_tables(text: str) -> list[Block]:
 
 
 def _fill_table(rows: list[list[str | None]]) -> list[list[str | None]]:
+    import sys
     filled: list[list[str | None]] = []
     previous: list[str | None] = []
     for row in rows:
@@ -380,7 +418,58 @@ def _fill_table(rows: list[list[str | None]]) -> list[list[str | None]]:
             out.append(value)
         previous = out
         filled.append(out)
-    return filled
+
+    # 规范化表格列数：处理 PDF 合并单元格导致的列数不一致
+    normalized = _normalize_table_columns(filled)
+    return normalized
+
+
+def _normalize_table_columns(rows: list[list[str | None]]) -> list[list[str | None]]:
+    """
+    规范化表格列数。处理 PDF 合并单元格导致的行列数不一致问题。
+    策略：找到最大列数作为目标，对列数不足的行进行补齐。
+    """
+    if not rows:
+        return rows
+
+    # 统计列数分布
+    col_counts = {}
+    for row in rows:
+        col_count = len(row)
+        col_counts[col_count] = col_counts.get(col_count, 0) + 1
+
+    if not col_counts:
+        return rows
+
+    # 选择最大列数作为目标（保留尽可能多的信息）
+    # 而不是最常见的列数，因为PDF合并单元格通常导致某些行列数减少
+    expected_cols = max(col_counts.keys())
+
+    # 如果所有行列数一致，直接返回
+    if len(col_counts) == 1:
+        return rows  # 已经一致，无需规范化
+
+    # 规范化：对列数不足的行，通过智能补齐来处理
+    normalized = []
+    for row in rows:
+        if len(row) == expected_cols:
+            normalized.append(row)
+        elif len(row) < expected_cols:
+            # 列数不足：补齐空值
+            # 策略：假设缺失的列在右边（典型 PDF 合并单元格症状）
+            padded = row + [None] * (expected_cols - len(row))
+            normalized.append(padded)
+        else:
+            # 列数过多：尝试合并多余的列到最后一列
+            # （可能是因为某些 cell 被错误分割）
+            excess = len(row) - expected_cols
+            merged = row[:expected_cols - 1] + [
+                " ".join(filter(None, [str(c) if c else "" for c in row[expected_cols - 1:]]))
+                or None
+            ]
+            normalized.append(merged)
+
+    return normalized
 
 
 def _is_continuation_row(row: list[str | None]) -> bool:

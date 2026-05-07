@@ -4,9 +4,9 @@
 
 ```yaml
 models:
-  extractor:  gpt-5-mini
-  verifier:   gpt-5-mini
-  classifier: gpt-5-mini
+  extractor:  gpt-4o-mini
+  verifier:   gpt-4o-mini
+  classifier: gpt-4o-mini
 
 concurrency:
   fetch_workers:      8
@@ -121,7 +121,7 @@ User：
 
 ## OpenAI Client
 
-- LLM 调用使用 OpenAI SDK，并读取 `settings.yaml` 中的 `gpt-5-mini` 模型名。
+- LLM 调用使用 OpenAI SDK，并读取 `settings.yaml` 中的 `gpt-4o-mini` 模型名。
 - Orchestrator 继续用信号量控制 LLM 并发。
 - 所有 LLM 输出仍必须通过 JSON schema 校验后才能进入下游模块。
 - Web 任务模式下，LLM 并发由 Worker 内信号量和全局配置共同控制，避免多用户同时访问时超出 API 限流。

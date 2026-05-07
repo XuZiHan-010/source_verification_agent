@@ -145,3 +145,15 @@ def test_report_diagnoses_fetch_failure_pdf_empty_and_not_found():
     assert "诊断：PDF已下载，但文本提取为空" in text
     assert "诊断：来源已读取，但没有命中声明关键词" in text
     assert "诊断：链接无法访问：404" in text
+
+
+def test_report_diagnoses_empty_body_status():
+    diagnosis = reporter._diagnose_reasoning(
+        verdict="not_verifiable",
+        status="empty_body",
+        content_type="pdf",
+        method="hyperlink",
+        reason="source fetch status is empty_body",
+    )
+
+    assert diagnosis == "服务器返回空响应（疑似反爬或登录重定向），无法核验"

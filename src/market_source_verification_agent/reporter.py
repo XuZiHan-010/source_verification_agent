@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import io
 import json
+import re
 from typing import Literal
 
 from .schema import Claim, ClassifyResult, IR, VerifyResult
@@ -279,18 +280,43 @@ def _diagnose_detail(detail: dict[str, str | float | None]) -> str:
     return _diagnose_reasoning(verdict, status, content_type, method, reason)
 
 
+_PDF_DIAG_RE = re.compile(r"\[diagnostic:\s*(.*?)\]\s*$")
+
+
+def _extract_pdf_diagnostic(reason: str) -> str:
+    match = _PDF_DIAG_RE.search(reason)
+    if not match:
+        return ""
+    raw = match.group(1).strip()
+    if "not a PDF" in raw:
+        return "下载到的不是 PDF（疑似 HTML 错误页）"
+    if "scanned/image-only" in raw or "all" in raw and "pages returned empty text" in raw:
+        return "PDF 无文本层，疑为扫描件；OCR 未启用"
+    if "pdfplumber.open failed" in raw:
+        return f"PDF 解析失败：{raw}"
+    if "cache file is empty" in raw:
+        return "缓存文件为 0 字节"
+    return raw
+
+
 def _diagnose_reasoning(verdict: str, status: str, content_type: str, method: str, reason: str) -> str:
     if method == "failed" or status == "skipped":
         return "没有可解析的来源URL"
     if status and status != "ok":
+        if status == "empty_body":
+            return "服务器返回空响应（疑似反爬或登录重定向），无法核验"
         return f"链接无法访问：{status}"
     if status == "ok" and (
         "source content is empty or unreadable" in reason
         or "empty or unreadable" in reason
         or "text extraction returned empty" in reason
     ):
+        diag = _extract_pdf_diagnostic(reason)
         if content_type == "pdf":
-            return "PDF已下载，但文本提取为空，可能是扫描件或不可读PDF；当前系统未启用OCR"
+            base = "PDF已下载，但文本提取为空"
+            if diag:
+                return f"{base}（{diag}）"
+            return f"{base}，可能是扫描件或不可读PDF；当前系统未启用OCR"
         return "页面可访问，但正文提取为空"
     if verdict == "not_found" or "no source passage mentions the claim keywords" in reason:
         return "来源已读取，但没有命中声明关键词"

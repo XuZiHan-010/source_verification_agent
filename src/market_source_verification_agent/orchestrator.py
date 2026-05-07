@@ -10,6 +10,7 @@ from uuid import uuid4
 from . import classifier, extractor, ingestor, reporter, resolver, verifier
 from .config import ROOT, Settings, load_settings, load_source_tiers
 from .schema import Claim, ClassifyResult, Report, ResolvedSource, VerifyResult
+from .usage import UsageAccumulator, compact_usage_summary
 
 
 def run(
@@ -23,6 +24,15 @@ def run(
 ) -> Report:
     started = datetime.now()
     settings = _settings(config)
+    usage_accumulator = UsageAccumulator()
+    existing_usage_callback = settings.usage_callback
+
+    def usage_callback(entry: dict) -> None:
+        usage_accumulator.add(entry)
+        if existing_usage_callback is not None:
+            existing_usage_callback(entry)
+
+    settings.usage_callback = usage_callback
     source_tiers = load_source_tiers()
     input_path = Path(input_path)
     fmt = fmt.lower()
@@ -30,7 +40,7 @@ def run(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     ir = ingestor.ingest(input_path)
-    claims = extractor.extract_claims(ir, limit=limit or settings.limits.max_claims_per_run)
+    claims = extractor.extract_claims(ir, limit=limit or settings.limits.max_claims_per_run, settings=settings)
     claims = _dedupe_claims(claims)
 
     with ThreadPoolExecutor(max_workers=settings.concurrency.fetch_workers) as pool:
@@ -48,7 +58,7 @@ def run(
         )
 
     class_groups = [
-        [classifier.classify(source, claim, source_tiers) for source in sources]
+        [classifier.classify(source, claim, source_tiers, settings) for source in sources]
         for claim, sources in zip(claims, source_groups)
     ]
     verifies = [
@@ -61,6 +71,10 @@ def run(
 
     payload = reporter.render(ir, claims, verify_map, class_map, fmt=fmt, detailed=detailed or settings.output.include_detail_column)  # type: ignore[arg-type]
     output_path.write_bytes(payload)
+    usage_summary = compact_usage_summary(usage_accumulator.snapshot())
+    report_summary = reporter.summarize(verify_map, class_map)
+    report_summary["usage"] = usage_summary
+    report_summary["cost_usd"] = usage_summary["estimated_cost_usd"]
 
     # Write sidecar summary (verdict counts + per-domain failure rates + llm_extract_calls)
     try:
@@ -68,7 +82,7 @@ def run(
 
         summary_path = output_path.with_name(output_path.stem + "_summary.json")
         summary_path.write_text(
-            _json.dumps(reporter.detailed_summary(verify_map, class_map), ensure_ascii=False, indent=2),
+            _json.dumps({**reporter.detailed_summary(verify_map, class_map), "usage": usage_summary}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     except Exception:
@@ -79,10 +93,10 @@ def run(
         run_id=str(uuid4()),
         input_path=str(input_path),
         output_path=str(output_path),
-        summary=reporter.summarize(verify_map, class_map),
+        summary=report_summary,
         started_at=started,
         finished_at=finished,
-        cost_usd=0.0,
+        cost_usd=usage_summary["estimated_cost_usd"],
         cache_hit_rate=0.0 if no_cache else 0.0,
     )
 

@@ -12,6 +12,7 @@ import hashlib
 import json
 import mimetypes
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
@@ -20,6 +21,7 @@ from uuid import uuid4
 from .config import ROOT, Settings, load_settings
 from .orchestrator import run
 from .schema import Artifact, RunEvent, RunTask
+from .usage import UsageAccumulator, add_persistent_usage, compact_usage_summary, read_persistent_usage
 
 CONTENT_TYPES = {
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -243,10 +245,35 @@ def execute_run(run_id: str, owner_id: str, store: TaskStore | None = None) -> R
     if task is None:
         raise KeyError(f"run not found: {run_id}")
 
+    usage_accumulator = UsageAccumulator()
+    usage_lock = threading.Lock()
+
+    def persist_usage(entry: dict) -> None:
+        usage_summary = compact_usage_summary(usage_accumulator.add(entry))
+        global_usage = add_persistent_usage(store.settings, entry)
+        with usage_lock:
+            latest = store.get_task(run_id, owner_id) or task
+            latest.summary = {
+                **(latest.summary or {}),
+                "usage": usage_summary,
+                "global_usage": global_usage,
+                "cost_usd": usage_summary["estimated_cost_usd"],
+            }
+            store.save_task(latest)
+
+    original_usage_callback = store.settings.usage_callback
+    store.settings.usage_callback = persist_usage
+
     try:
         task.status = "running"
         task.current_stage = "ingest"
         task.started_at = datetime.now()
+        task.summary = {
+            **(task.summary or {}),
+            "usage": compact_usage_summary(usage_accumulator.snapshot()),
+            "global_usage": read_persistent_usage(store.settings),
+            "cost_usd": 0.0,
+        }
         store.save_task(task)
         store.add_event(run_id, "running", "info", "Run started")
 
@@ -267,8 +294,14 @@ def execute_run(run_id: str, owner_id: str, store: TaskStore | None = None) -> R
         task.status = "completed"
         task.current_stage = "completed"
         task.finished_at = datetime.now()
-        task.summary = report.summary
-        task.total_claims = report.summary.get("total", 0)
+        usage_summary = compact_usage_summary(usage_accumulator.snapshot())
+        task.summary = {
+            **report.summary,
+            "usage": usage_summary,
+            "global_usage": read_persistent_usage(store.settings),
+            "cost_usd": usage_summary["estimated_cost_usd"],
+        }
+        task.total_claims = int(report.summary.get("total", 0) or 0)
         task.completed_claims = task.total_claims
         task.artifact_ids = [artifact.artifact_id]
         store.save_task(task)
@@ -282,6 +315,8 @@ def execute_run(run_id: str, owner_id: str, store: TaskStore | None = None) -> R
         store.save_task(task)
         store.add_event(run_id, "failed", "error", str(exc))
         return task
+    finally:
+        store.settings.usage_callback = original_usage_callback
 
 
 def artifact_from_file(path: Path, run_id: str, owner_id: str, fmt: str) -> Artifact:

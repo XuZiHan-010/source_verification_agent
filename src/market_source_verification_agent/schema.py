@@ -51,7 +51,7 @@ class ResolvedSource(BaseModel):
     url: str | None = None
     domain: str | None = None
     title: str | None = None
-    fetch_status: Literal["ok", "404", "forbidden", "timeout", "paywalled", "skipped"]
+    fetch_status: Literal["ok", "404", "forbidden", "timeout", "paywalled", "skipped", "empty_body"]
     local_cache_path: str | None = None
     content_type: Literal["html", "pdf", "text", "unknown"] | None = None
     content_hash: str | None = None
@@ -85,7 +85,7 @@ class Report(BaseModel):
     run_id: str
     input_path: str
     output_path: str
-    summary: dict[str, int] = Field(default_factory=dict)
+    summary: dict[str, object] = Field(default_factory=dict)
     started_at: datetime
     finished_at: datetime
     cost_usd: float | None = None
@@ -114,7 +114,7 @@ class RunTask(BaseModel):
         "completed",
         "failed",
     ] = "queued"
-    summary: dict[str, int] = Field(default_factory=dict)
+    summary: dict[str, object] = Field(default_factory=dict)
     artifact_ids: list[str] = Field(default_factory=list)
     error: str | None = None
     created_at: datetime

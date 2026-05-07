@@ -12,6 +12,7 @@ tiers:
       - ".edu"
       - ".mil"
     domains:
+      - gov.cn              # 中国政府网 / 国务院门户
       - mot.gov.cn          # 交通运输部 / 民航局《行业发展统计公报》
       - mee.gov.cn          # 生态环境部
       - ndrc.gov.cn         # 国家发展改革委
@@ -22,6 +23,7 @@ tiers:
       - stats.gov.cn        # 国家统计局
       - sec.gov             # 美国 SEC
     name_keywords:
+      - 中国政府网
       - 国务院
       - 中央军委
       - 中共中央

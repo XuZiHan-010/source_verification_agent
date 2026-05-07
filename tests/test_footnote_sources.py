@@ -96,6 +96,43 @@ def test_wrapped_no_space_pdf_footnote_text_is_parsed():
     assert footnotes[2] == "https://www.gov.cn/example.htm"
 
 
+def test_mojibake_superscript_pdf_footnote_text_is_parsed():
+    class FakePage:
+        def get_links(self):
+            return []
+
+    class FakePlumberPage:
+        def extract_text(self):
+            return (
+                "鹿https://www.gov.cn/yaowen/liebiao/202404/content_6943071.htm\n"
+                "虏https://www.xinhuanet.com/example.htm\n"
+                "鲁https://www.caict.ac.cn/report.pdf\n"
+            )
+
+    footnotes = ingestor._extract_page_footnotes(FakePage(), FakePlumberPage())
+
+    assert footnotes[1] == "https://www.gov.cn/yaowen/liebiao/202404/content_6943071.htm"
+    assert footnotes[2] == "https://www.xinhuanet.com/example.htm"
+    assert footnotes[3] == "https://www.caict.ac.cn/report.pdf"
+
+
+def test_mojibake_superscript_near_link_number_is_parsed():
+    class Rect:
+        x0 = 30
+        y0 = 10
+        y1 = 20
+
+    class FakePage:
+        def get_text(self, mode):
+            assert mode == "words"
+            return [
+                (10, 10, 16, 20, "虏"),
+                (60, 10, 90, 20, "https://example.com"),
+            ]
+
+    assert ingestor._nearest_link_number(FakePage(), Rect()) == 2
+
+
 def test_pdf_table_dump_paragraph_is_not_extracted_as_claim():
     text = (
         "指标 数值 年份 地区/口径 来源 备注\n"
@@ -144,12 +181,25 @@ def test_matrix_table_is_split_by_cell_footnotes():
 
     claims = extractor.extract_claims(ir)
 
-    assert len(claims) == 4
-    assert claims[0].metric == "航空装备域：低空飞行器"
-    assert claims[0].source_urls == ["https://example.com/report-a", "https://example.com/report-b"]
-    assert claims[1].metric == "航空装备域：低空飞行器 / 应用场景"
-    assert claims[1].source_urls == ["https://example.com/app-a", "https://example.com/app-b"]
-    assert claims[2].metric == "航空装备域：低空飞行器 / 目标客户/用户"
-    assert claims[2].source_urls == ["https://example.com/customer-a", "https://example.com/customer-b"]
-    assert claims[3].metric == "航空装备域：低空飞行器 / 备注"
-    assert claims[3].source_urls == ["https://example.com/note-a"]
+    # Matrix tables now aggregate one logical row into a single claim instead
+    # of one-claim-per-cell, so a 4-field row produces 1 claim with all URLs
+    # collected.
+    assert len(claims) == 1
+    claim = claims[0]
+    assert claim.metric == "航空装备域：低空飞行器"
+    assert claim.value.startswith("无人机")
+    expected_urls = {
+        "https://example.com/report-a",
+        "https://example.com/report-b",
+        "https://example.com/app-a",
+        "https://example.com/app-b",
+        "https://example.com/customer-a",
+        "https://example.com/customer-b",
+        "https://example.com/source-a",
+        "https://example.com/source-b",
+        "https://example.com/source-c",
+        "https://example.com/note-a",
+    }
+    assert set(claim.source_urls) == expected_urls
+    for label in ("应用场景", "目标客户/用户", "备注", "代表产品"):
+        assert label in claim.statement

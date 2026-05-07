@@ -1,7 +1,7 @@
 models:
-  extractor:  gpt-5-mini
-  verifier:   gpt-5-mini
-  classifier: gpt-5-mini
+  extractor:  gpt-4o-mini
+  verifier:   gpt-4o-mini
+  classifier: gpt-4o-mini
 
 concurrency:
   fetch_workers:        8

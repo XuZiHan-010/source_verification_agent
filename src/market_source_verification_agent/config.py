@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 from pydantic import BaseModel, Field
@@ -31,9 +31,9 @@ def load_environment() -> None:
 
 
 class ModelSettings(BaseModel):
-    extractor: str = "gpt-5-mini"
-    verifier: str = "gpt-5-mini"
-    classifier: str = "gpt-5-mini"
+    extractor: str = "gpt-4o-mini"
+    verifier: str = "gpt-4o-mini"
+    classifier: str = "gpt-4o-mini"
 
 
 class ConcurrencySettings(BaseModel):
@@ -125,8 +125,9 @@ class Settings(BaseModel):
     search: SearchSettings = Field(default_factory=SearchSettings)
     output: OutputSettings = Field(default_factory=OutputSettings)
     limits: LimitSettings = Field(default_factory=LimitSettings)
+    usage_callback: Callable[[dict[str, Any]], None] | None = Field(default=None, exclude=True)
 
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "ignore", "arbitrary_types_allowed": True}
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:

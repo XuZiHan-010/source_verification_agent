@@ -31,6 +31,17 @@ data/cache/
 .vscode/
 .idea/
 
+# Temporary & debug scripts
+debug_*.py
+diagnose_*.py
+analyze_*.py
+trace_*.py
+test_*.py
+test_*.json
+claim-*.md
+agent.md
+scripts/
+
 # OS
 .DS_Store
 Thumbs.db

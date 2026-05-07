@@ -33,7 +33,7 @@
 2. **域名后缀规则**：`*.gov` / `*.gov.cn` / `*.edu` → A；
 3. **机构名匹配**（无 URL 时）：`source_name_raw` 含「国务院/民航局/统计局/工信部/...」→ A；含「新华社/赛迪/IDC/...」→ B。
 4. **fetch 失败**（404/timeout）：直接 C，附 `tier_reason="link_dead"`。
-5. **以上都不命中**：调 `gpt-5-mini` LLM 兜底，给定域名 / 标题 / 简介 → A/B/C，写入 `tier_reason`。
+5. **以上都不命中**：调 `gpt-4o-mini` LLM 兜底，给定域名 / 标题 / 简介 → A/B/C，写入 `tier_reason`。
 6. **保守原则**：LLM 不确定时降一档（A→B、B→C）。
 
 ## 与 Verifier 的关系

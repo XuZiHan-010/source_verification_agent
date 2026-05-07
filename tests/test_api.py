@@ -122,3 +122,98 @@ runtime:
     assert delete_response.status_code == 200
     assert delete_response.json()["deleted"] == 2
     assert client.get("/api/runs").json() == []
+
+
+def test_fastapi_missing_history_artifact_is_404(monkeypatch):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    monkeypatch.setenv("API_KEYS", "")
+    test_root = Path.cwd() / "data" / "test_api" / uuid4().hex
+    test_root.mkdir(parents=True, exist_ok=True)
+    settings_path = test_root / "settings.yaml"
+    settings_path.write_text(
+        f"""
+storage:
+  uploads_dir: {test_root / "uploads"}
+  reports_dir: {test_root / "reports"}
+cache:
+  dir: {test_root / "cache"}
+output:
+  default_format: json
+auth:
+  require_auth: false
+queue:
+  backend: local
+runtime:
+  task_store_backend: local
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MARKET_SOURCE_SETTINGS", str(settings_path))
+
+    from fastapi.testclient import TestClient
+
+    from market_source_verification_agent.api import create_app
+    from market_source_verification_agent.tasks import LocalTaskStore, artifact_from_file, owner_hash
+    from market_source_verification_agent.usage import add_persistent_usage
+
+    import market_source_verification_agent.api as api_module
+
+    original_load_settings = api_module.load_settings
+    api_module.load_settings = lambda: original_load_settings(settings_path)
+    try:
+        settings = original_load_settings(settings_path)
+        add_persistent_usage(
+            settings,
+            {
+                "model": "gpt-4o-mini",
+                "calls": 1,
+                "input_tokens": 100,
+                "cached_input_tokens": 0,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "estimated_cost_usd": 0.000027,
+            },
+        )
+        store = LocalTaskStore(settings)
+        owner_id = owner_hash("anonymous-local-dev")
+        task = store.create_run(
+            owner_id=owner_id,
+            input_kind="text",
+            requested_format="json",
+            detailed=False,
+        )
+        task.status = "completed"
+        task.current_stage = "completed"
+        store.save_task(task)
+
+        output_dir = Path(settings.storage.reports_dir) / task.run_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        result_path = output_dir / "result.json"
+        result_path.write_text("[]", encoding="utf-8")
+        artifact = artifact_from_file(result_path, task.run_id, owner_id, "json")
+        store.save_artifact(artifact)
+        task.artifact_ids = [artifact.artifact_id]
+        store.save_task(task)
+
+        result_path.unlink()
+        client = TestClient(create_app())
+    finally:
+        api_module.load_settings = original_load_settings
+
+    runs_response = client.get("/api/runs")
+    assert runs_response.status_code == 200
+    assert runs_response.json()[0]["result_available"] is False
+
+    status_response = client.get(f"/api/runs/{task.run_id}")
+    assert status_response.status_code == 200
+    assert status_response.json()["run"]["result_available"] is False
+
+    result_response = client.get(f"/api/runs/{task.run_id}/result")
+    assert result_response.status_code == 404
+    assert result_response.json()["detail"] == "Result artifact not found on disk"
+
+    usage_response = client.get("/api/usage")
+    assert usage_response.status_code == 200
+    assert usage_response.json()["total_tokens"] == 120
+    assert usage_response.json()["estimated_cost_usd"] == 0.000027

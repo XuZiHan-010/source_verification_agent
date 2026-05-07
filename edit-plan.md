@@ -1,117 +1,101 @@
-# 前端全面美化 — 企业级 Analytics Dashboard 重设计
+# 修复 0 字节 PDF 缓存 & 削减 LLM token 浪费
 
 ## Context
 
-此次重设计面向 Henkel 战略与市场部门，作为实习交付产品。当前界面过于"开发者/黑客终端"风格（`//` 注释式标签、极暗纯黑背景、decorative serif 字体），不适合非技术业务受众。目标：在保留所有 JS 逻辑不变的前提下，将视觉风格升级为**专业内部分析工具**（精致 · 可信 · 数据导向）。
+上一轮加诊断后已能确认大量「PDF 已下载但文本提取为空」的真实原因是「缓存文件为 0 字节」——HTTP 200 但响应体为空（反爬 / 登录页重定向 / CDN 故障），却被当作成功缓存。诊断只是把"未知问题"变成"已知问题"，PDF 仍然无法核验。
+
+同时本次盘点发现 verifier 完全没有 LLM 缓存，每次跑相同输入都重复烧 token；BM25 零命中时还会喂"前 K 段兜底段落"给 LLM，几乎注定返回 not_found，纯属浪费。
+
+本次目标：
+1. **修 0 字节缓存根因**：HTTP 200 但 body 为空时，不当作成功，触发重试或标记失败，绝不写 0 字节文件。
+2. **大幅削减 LLM 调用**：给 verifier 加磁盘缓存（仿 classifier）；BM25 零命中时直接 not_found，不调 LLM。
 
 ---
 
-## 设计方向：Precision Analytics Dark
+## 修复方案
 
-**核心关键词**：深海蓝底、蓝宝石主色、精致数据卡片、清晰层级、去除 dev jargon
+### 修复 1：拒绝 0 字节响应体（[resolver.py](src/market_source_verification_agent/resolver.py)）
 
-### 1. 字体
-| 用途 | 字体 |
-|---|---|
-| 英文/数字标题 display | `Sora` (Google Fonts) |
-| 中文正文 | `Noto Sans SC` |
-| 数据/标签/代码 | `JetBrains Mono` (保留) |
+**根因位置**：[resolver.py:200-205 `_http_get_with_retry`](src/market_source_verification_agent/resolver.py#L200) 只看 `status_code == 200` 就当成功；[resolver.py:179 `_persist`](src/market_source_verification_agent/resolver.py#L179) 无脑 `cache_path.write_bytes(body)`。
 
-### 2. 颜色 token 重设
-```css
---bg:        #080C14   /* 深海蓝底，非纯黑 */
---bg-2:      #0C1120
---surface:   #111827   /* warm dark navy */
---surface-2: #1B2333
---border:    #1F2D42
---border-2:  #2A3D58
---text:      #E2E8F0
---text-2:    #94A3B8
---text-3:    #4B5E79
---text-4:    #2D3D52
+**改造**：
+- 在 `_http_get_with_retry` 内 `status_code == 200` 分支增加 `if not response.content or len(response.content) < _MIN_BODY_BYTES:` 判断（PDF 至少 ~1KB，HTML 至少 ~200B），把这种响应当作软失败 → 触发当前已存在的重试逻辑；最终全部失败时返回新状态 `"empty_body"`。
+- 在 `_persist` 入口加防御性 `if not body: return None` 保险栓，确保任何路径都不会落 0 字节。
+- `ResolvedSource.fetch_status` 已是 Literal，新增 `"empty_body"` 进白名单（[schema.py:54](src/market_source_verification_agent/schema.py#L54)）。
+- 重试时切换 `_BROWSER_UA_FALLBACK`（已存在 [resolver.py:26](src/market_source_verification_agent/resolver.py#L26)），覆盖部分对 UA 敏感的反爬。
+- [reporter.py:285](src/market_source_verification_agent/reporter.py#L285) 已有 `if status and status != "ok"` 分支，新增 `empty_body` 中文映射「服务器返回空响应（疑似反爬或登录重定向）」。
 
---accent:    #3B82F6   /* 品牌主色：专业蓝 */
---accent-bg: rgba(59,130,246,.10)
+### 修复 2：Verifier 加磁盘缓存（仿 classifier 模式）
 
---ok:        #10B981   /* 核验通过 */
---warn:      #F59E0B   /* 部分支持 */
---bad:       #F87171   /* 未找到 */
---crit:      #DC2626   /* 矛盾 */
---mute:      #4B5E79   /* 无法验证 */
+**当前问题**：[verifier.py:209-261 `_judge_by_llm`](src/market_source_verification_agent/verifier.py#L209) 直接调 `client.chat.completions.create()`，无任何缓存。
 
---flag:      #EF4444   /* 标红/可疑 */
+**改造**：完全照搬 [classifier.py:178-213](src/market_source_verification_agent/classifier.py#L178) 的 `_llm_cache_paths` / `_read_cache` / `_write_cache`：
+- 缓存目录：`{cache.dir}/verify/`
+- TTL：`settings.cache.verify_ttl_days`（已存在，默认 7 天）
+- Cache key：`sha1(source.content_hash + claim.statement + claim.value + claim.year)`——不包含 claim_id，确保不同 claim_id 指向同一 (source 内容, 声明) 时也命中缓存
+- 缓存内容：`{verdict, confidence, evidence_quote, evidence_locator, reasoning}`
+- 命中即返回 `VerifyResult(...)`，跳过 OpenAI 调用
 
---tier-a:    #60A5FA
---tier-b:    #34D399
---tier-c:    #F87171
+**预期收益**：第二次跑同一份 PDF 输入的 LLM 调用量降到 0；不同 PDF 但引用相同 source 的 claim 也直接复用。
+
+### 修复 3：BM25 零命中时跳过 LLM
+
+**当前问题**：[verifier.py:87-104 `retrieve_passages`](src/market_source_verification_agent/verifier.py#L87) 当所有 BM25 分数 == 0 时返回前 K 段（locator 标了 `(fallback)`），然后 [verifier.py:73-84 `verify`](src/market_source_verification_agent/verifier.py#L73) 仍把这堆兜底段落喂给 LLM。绝大多数情况 LLM 会判 not_found，纯粹烧 token。
+
+**改造**：在 [verify()](src/market_source_verification_agent/verifier.py#L28) 中检测 passages 是否全是 fallback（`all(p.score == 0.0 for p in passages)` 或 locator 包含 `(fallback)`），是则直接返回：
+```python
+return VerifyResult(
+    claim_id=claim.claim_id,
+    verdict="not_found",
+    confidence=0.15,
+    reasoning="no lexical overlap with source after synonym expansion (LLM skipped to save tokens)",
+)
 ```
 
-### 3. 主要视觉变更
+**安全网**：同义词扩展 [`_expand_query_text`](src/market_source_verification_agent/verifier.py#L98) 已经存在；用户已经维护了 [verifier_synonyms.yaml](config/verifier_synonyms.yaml)。如果某个真支持的 claim 因为同义词没覆盖被错判 not_found，正确做法是补 `verifier_synonyms.yaml`，不是浪费 LLM token 兜底。
 
-#### Nav
-- 品牌名改为中英双行：「源验」/「Source Verify」
-- 增加 Henkel internship 小标签 `STRATEGIC INTELLIGENCE v0.1`
-- API Key 字段更优雅（label内嵌 icon）
-- 历史记录按钮：改为 outline 蓝色按钮
+**预期收益**：根据当前截图（33 claim，2 个未命中），保守估计减少 5–15% LLM 调用；如果 PDF 提取失败修好后 source 内容更丰富，BM25 命中率会更高，节省可能更显著。
 
-#### Hero
-- 去除 `//` 前缀标签
-- 上传标签：「上传文件」「粘贴文本」（非 `// 上传文件`）
-- 主标题：保持中文有力 copy，但字体换 Sora italic + Noto Sans SC
-- 副文案保持中文业务语境
-- 上传卡：玻璃态 (glassmorphism-lite) — `backdrop-filter + border-glow`
+### 修复 4：[reporter.py](src/market_source_verification_agent/reporter.py) 中文文案补充
 
-#### Pipeline 进度条
-- stage 卡片更宽松，加 icon 前缀（数字圆圈）
-- 完成状态：绿色 checkmark，非单纯文字
-- 优化底部进度线动画
-
-#### Summary 统计卡
-- 4 卡保持，但内部布局更干净
-- 数字更大更有力（`font-size: 64px`）
-- 百分比进度条改为更优雅的弧形/分段进度
-
-#### Report 表格
-- Filter pill → **segmented control** 样式（更接近业务工具）
-- 下载按钮组：独立区域，主按钮 XLSX highlighted
-- 表头：去掉 `added` 红色标注，改为蓝色左border
-- 行 hover：更明显的蓝色左侧 highlight
-- Verdict badge：pill 样式带背景色，更易读
-- 来源列：去掉 scrollable box，直接截断 + tooltip
-
-#### Drawer 详情面板
-- 更干净的 key-value 布局
-- 多源核验明细：用卡片列表代替纯文本
-- 证据引用：更精致的引用块
-
-#### Footer
-- 简化为只有 Product info + 版本号
+新增 fetch_status 映射：
+- `empty_body` → 「服务器返回空响应（疑似反爬或登录重定向），无法核验」
+- 已有的 `"PDF已下载，但文本提取为空"` 分支保留（覆盖真扫描件）
 
 ---
 
-## 关键约束（JS 钩子 — 不得更改）
+## 不做的事（明确边界）
 
-以下 HTML id/class 必须原封不动保留：
-- IDs: `fileInput`, `drop`, `pipeline`, `report`, `mask`, `drawer`, `drawer-id`, `drawer-body`, `drawer-close`, `histMask`, `histPanel`, `histBody`, `histClose`, `apiKeyInput`
-- Classes: `.filter-pill[data-filter]`, `.download-group button`, `.summary .stat`, `.upload-tabs button[data-tab]`, `[data-pane]`, `#pipeline .stage`, `.stage .status`, `.stage .bar`, `.stage .num`, `.stage .name`
-- Selectors in JS: `.hero .corner-meta`, `#report tbody`, `.verdict`, `.tier`, `.metric`, `.num`, `.year`, `.src`, `.domain`, `.row-id`, `.reason`, `.col-verdict`, `.col-tier`
-- Global functions: `runDemo`, `openHistory`
-- `.btn-primary` on the run buttons
-- JS script block: 完全不改变
+- ❌ **不引入 OCR**：本轮只解决"下载就是空"的问题；真扫描件留给后续。引入 PaddleOCR 等会带几十 MB 依赖、推理时间 + 模型权重，性价比远低于先把下载修对。
+- ❌ **不加 PyMuPDF 备选引擎**：当前问题不是 pdfplumber 解析失败，而是文件本身 0 字节。pdfplumber 没出错就别多此一举。
+- ❌ **不重写 source-level 去重逻辑**：orchestrator 已有 claim 级 dedup（[orchestrator.py:187-217](src/market_source_verification_agent/orchestrator.py#L187)），加 verifier 缓存后效果与 source-dedup 等价，避免改 orchestrator 的复杂调度。
 
 ---
 
-## 修改文件
+## 关键文件
 
-- [web/demo.html](web/demo.html) — 完全重写 `<style>` + 局部 HTML label 改进（不动 `<script>`）
+- [src/market_source_verification_agent/resolver.py](src/market_source_verification_agent/resolver.py) — `_http_get_with_retry` (line ~191)、`_persist` (line ~178)
+- [src/market_source_verification_agent/verifier.py](src/market_source_verification_agent/verifier.py) — `verify` (line ~28)、`_judge_by_llm` (line ~209)、`retrieve_passages` (line ~87)
+- [src/market_source_verification_agent/schema.py:54](src/market_source_verification_agent/schema.py#L54) — `fetch_status` Literal 加 `empty_body`
+- [src/market_source_verification_agent/reporter.py:282-294](src/market_source_verification_agent/reporter.py#L282) — 中文诊断文案
+- 复用：[classifier.py:178-213](src/market_source_verification_agent/classifier.py#L178) 的缓存模板、[config/settings.yaml:13-17](config/settings.yaml#L13) 的 `cache.verify_ttl_days`
 
----
+## 实施步骤
+
+1. ✅ **schema.py** 加 `"empty_body"` 到 `fetch_status` Literal。
+2. ✅ **resolver.py** 在 `_http_get_with_retry` 加 0 字节守卫 + UA 切换重试；`_persist` 加防御性返回 None。
+3. ✅ **verifier.py** 把 classifier 的缓存三件套（`_llm_cache_paths` / `_read_cache` / `_write_cache`）抽出来或复制一份，包到 `_judge_by_llm` 入口与出口。
+4. ✅ **verifier.py** `verify()` 中检测全 fallback passages，直接返回 not_found（不调 LLM）。
+5. ✅ **reporter.py** 中文文案补 `empty_body` 映射。
+6. ✅ **测试更新**：
+   - [tests/test_resolver_extraction.py](tests/test_resolver_extraction.py) 加用例：HTTP 200 + 空 body 不应写缓存。
+   - [tests/test_verifier_semantics.py](tests/test_verifier_semantics.py) 加用例：BM25 零命中时不调 LLM；缓存命中时不调 LLM。
+   - [tests/test_multi_source_reporting.py](tests/test_multi_source_reporting.py) 加用例：`empty_body` 中文诊断文案。
 
 ## 验证
 
-1. 在浏览器打开 `web/demo.html` 检查页面渲染
-2. 上传测试文件确认所有按钮/拖拽功能正常
-3. 检查 filter pills / download group 功能
-4. 检查 drawer 打开/关闭
-5. 检查 history panel 打开/关闭
-6. 检查响应式（缩小到 960px 以下）
+- 跑 `examples/低空经济_input.pdf`，对比修复前后：
+  - 「缓存文件为 0 字节」诊断应大幅减少（重试 + UA 切换能挽救一部分），剩余的应明确显示为「服务器返回空响应」而非含糊的「PDF 已下载但提取为空」。
+  - 第二次跑同一份输入，LLM 调用量应接近 0（缓存全命中）。
+  - 监控 `data/cache/verify/` 目录文件数应 ≈ 第一轮 LLM 调用次数。
+- 单测：上述 3 项新用例全过 + 现有 36 个测试不回归。

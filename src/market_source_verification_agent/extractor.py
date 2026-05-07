@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from dataclasses import dataclass
 
 from .errors import NoClaimsFound
 from .schema import Block, Claim, IR
+
+logger = logging.getLogger(__name__)
 
 
 def _compact_text(value: str | None) -> str:
@@ -93,7 +97,7 @@ class HeaderMap:
     notes: list[int] | None = None
 
 
-def extract_claims(ir: IR, limit: int | None = None) -> list[Claim]:
+def extract_claims(ir: IR, limit: int | None = None, settings=None) -> list[Claim]:
     """Extract row-level claims using deterministic table heuristics."""
 
     claims: list[Claim] = []
@@ -107,7 +111,7 @@ def extract_claims(ir: IR, limit: int | None = None) -> list[Claim]:
             section_path = section_path[: level - 1] + [block.text.strip()]
         elif block.type == "table" and block.rows:
             table_idx += 1
-            claims.extend(_table_to_claims(ir.doc_id, table_idx, block, section_path))
+            claims.extend(_table_to_claims(ir.doc_id, table_idx, block, section_path, settings=settings))
         elif block.type in {"paragraph", "list"} and block.text:
             para_idx += 1
             claim = _paragraph_to_claim(ir.doc_id, para_idx, block.text, section_path)
@@ -121,7 +125,7 @@ def extract_claims(ir: IR, limit: int | None = None) -> list[Claim]:
     return claims
 
 
-def _table_to_claims(doc_id: str, table_idx: int, block: Block, section_path: list[str]) -> list[Claim]:
+def _table_to_claims(doc_id: str, table_idx: int, block: Block, section_path: list[str], settings=None) -> list[Claim]:
     rows = [row for row in block.rows or [] if any(_clean(cell) for cell in row)]
     if len(rows) < 2:
         return []
@@ -130,11 +134,11 @@ def _table_to_claims(doc_id: str, table_idx: int, block: Block, section_path: li
     headers = [_clean(cell) for cell in rows[header_idx]]
     mapping = _map_headers(headers)
     if _looks_like_policy_table(headers):
-        return _policy_table_to_claims(doc_id, table_idx, rows[header_idx + 1 :], headers, block, section_path)
+        return _policy_table_to_claims(doc_id, table_idx, rows[header_idx + 1 :], headers, block, section_path, settings=settings)
     if _looks_like_regulatory_table(headers):
-        return _regulatory_table_to_claims(doc_id, table_idx, rows[header_idx + 1 :], headers, block, section_path)
+        return _regulatory_table_to_claims(doc_id, table_idx, rows[header_idx + 1 :], headers, block, section_path, settings=settings)
     if _looks_like_matrix_table(headers):
-        return _matrix_table_to_claims(doc_id, table_idx, rows[header_idx + 1 :], headers, block, section_path)
+        return _matrix_table_to_claims(doc_id, table_idx, rows[header_idx + 1 :], headers, block, section_path, settings=settings)
     data_rows = _merge_logical_rows(rows[header_idx + 1 :], mapping)
     claims: list[Claim] = []
 
@@ -268,10 +272,26 @@ def _policy_table_to_claims(
     headers: list[str],
     block: Block,
     section_path: list[str],
+    settings=None,
 ) -> list[Claim]:
     normalized = [[_clean(cell) for cell in row] for row in rows if any(_clean(cell) for cell in row)]
     if not normalized:
         return []
+
+    # 检测列数不一致（在填充前）
+    expected_cols = len(headers)
+    has_column_mismatch = any(len(row) != expected_cols for row in normalized)
+
+    # 如果有列数不匹配，先尝试用LLM修复
+    if has_column_mismatch and settings:
+        llm_result = _llm_normalize_table_columns(normalized, headers, settings=settings)
+        if llm_result:
+            normalized = llm_result
+            has_column_mismatch = False
+
+    # 如果LLM未能修复，则用简单的填充方法
+    if has_column_mismatch:
+        normalized = [row + [""] * (expected_cols - len(row)) if len(row) < expected_cols else row for row in normalized]
 
     metric_idx = _header_index(headers, ("政策", "法规", "标准")) or 0
     agency_idx = _header_index(headers, ("发布机构",))
@@ -279,7 +299,24 @@ def _policy_table_to_claims(
     source_idx = _header_index(headers, ("来源",))
     if source_idx is None:
         return []
-    core_start = _header_index(headers, ("核心内容",))
+
+    if has_column_mismatch:
+        # 对于列数不一致的表格，从源列往前查找内容列
+        # 源信息通常在末尾，所以内容在它之前
+        if source_idx is not None and source_idx > 0:
+            core_start = source_idx - 1
+            # 如果倒数第二列是空的，往前找
+            while core_start > metric_idx and all(not _clean(row[core_start] if core_start < len(row) else "") for row in normalized):
+                core_start -= 1
+        else:
+            # 如果没有source_idx，查找除了最后几列的最长内容列
+            core_start = _find_content_column_by_characteristics(normalized, start_search=metric_idx + 1, end_search=max(len(headers) - 2, metric_idx + 2))
+    else:
+        # 列数一致，优先用列名，其次用智能检测
+        core_start = _header_index(headers, ("核心内容",))
+        if core_start is None:
+            core_start = _find_content_column_by_characteristics(normalized, start_search=metric_idx + 1, end_search=source_idx or len(headers))
+
     core_indexes = _content_indexes_between(headers, core_start, source_idx)
     region_indexes = [idx for idx in (3, 4, 5) if idx < source_idx]
 
@@ -331,13 +368,48 @@ def _regulatory_table_to_claims(
     headers: list[str],
     block: Block,
     section_path: list[str],
+    settings=None,
 ) -> list[Claim]:
     normalized = [[_clean(cell) for cell in row] for row in rows if any(_clean(cell) for cell in row)]
     if not normalized:
         return []
 
-    req_idx = _header_index(headers, ("具体要求",)) or 3
-    object_idx = _header_index(headers, ("适用对象",)) or min(req_idx + 3, len(headers) - 1)
+    # Handle rows with mismatched column counts (from PDF merged cells)
+    expected_cols = len(headers)
+    has_column_mismatch = any(len(row) != expected_cols for row in normalized)
+
+    # 如果有列数不匹配，先尝试用LLM修复
+    if has_column_mismatch and settings:
+        llm_result = _llm_normalize_table_columns(normalized, headers, settings=settings)
+        if llm_result:
+            normalized = llm_result
+            has_column_mismatch = False
+
+    # 如果LLM未能修复，则用简单的填充方法
+    if has_column_mismatch:
+        normalized = [row + [""] * (expected_cols - len(row)) if len(row) < expected_cols else row for row in normalized]
+
+    req_idx = _header_index(headers, ("具体要求",))
+    if req_idx is None or len(normalized) > 0 and len(normalized[0]) != len(headers):
+        # 使用智能检测找具体要求列
+        req_idx = _find_content_column_by_characteristics(normalized, start_search=1, end_search=min(6, len(headers)))
+    else:
+        # 验证找到的列
+        req_idx_smart = _find_content_column_by_characteristics(normalized, start_search=1, end_search=min(6, len(headers)))
+        if abs(req_idx_smart - req_idx) > 2:
+            req_idx = req_idx_smart
+
+    object_idx = _header_index(headers, ("适用对象",))
+    if object_idx is None or len(normalized) > 0 and len(normalized[0]) != len(headers):
+        # 使用智能检测找适用对象列
+        search_start = min((req_idx or 3) + 1, len(headers) - 1)
+        object_idx = _find_content_column_by_characteristics(normalized, start_search=search_start, end_search=len(headers) - 2)
+    else:
+        # 验证找到的列
+        search_start = min((req_idx or 3) + 1, len(headers) - 1)
+        object_idx_smart = _find_content_column_by_characteristics(normalized, start_search=search_start, end_search=len(headers) - 2)
+        if abs(object_idx_smart - object_idx) > 2:
+            object_idx = object_idx_smart
     agency_idx = _header_index(headers, ("发布机构",))
     source_idx = _header_index(headers, ("来源",))
     note_idx = _header_index(headers, ("备注",))
@@ -393,10 +465,26 @@ def _matrix_table_to_claims(
     headers: list[str],
     block: Block,
     section_path: list[str],
+    settings=None,
 ) -> list[Claim]:
     normalized = [[_clean(cell) for cell in row] for row in rows if any(_clean(cell) for cell in row)]
     if not normalized:
         return []
+
+    # Handle rows with mismatched column counts (from PDF merged cells)
+    expected_cols = len(headers)
+    has_column_mismatch = any(len(row) != expected_cols for row in normalized)
+
+    # 如果有列数不匹配，先尝试用LLM修复
+    if has_column_mismatch and settings:
+        llm_result = _llm_normalize_table_columns(normalized, headers, settings=settings)
+        if llm_result:
+            normalized = llm_result
+            has_column_mismatch = False
+
+    # 如果LLM未能修复，则用简单的填充方法
+    if has_column_mismatch:
+        normalized = [row + [""] * (expected_cols - len(row)) if len(row) < expected_cols else row for row in normalized]
 
     category_idx = _header_index(headers, ("分类",)) or 0
     product_idx = _header_index(headers, ("代表产品", "服务"))
@@ -407,12 +495,20 @@ def _matrix_table_to_claims(
 
     claims: list[Claim] = []
     groups = _matrix_groups(normalized, category_idx, source_idx, note_idx)
-    row_offset = 1
-    for group in groups:
+    for row_offset, group in enumerate(groups, start=1):
         base = group[0]
         category = _cell_at(base, category_idx) or ""
-        source_text = _cell_at(base, source_idx) or ""
+        if not category or _looks_like_broken_fragment(category):
+            continue
+        source_text = _join_group_column(group, source_idx) if source_idx is not None else ""
         source_name = _sanitize_source_name(source_text)
+        _, source_col_urls = _resolve_footnote_urls(source_text, block.footnotes)
+
+        # Collect every non-empty field cell in the group as a (label, text)
+        # contribution to a single aggregated claim, instead of emitting one
+        # claim per cell (which used to inflate ~30 logical rows into ~80
+        # claims).
+        kept: list[tuple[int, str, str, str, list[str]]] = []  # (col_idx, label, clean_text, value, urls)
         used_columns: set[int] = set()
         for field_idx in field_indexes:
             start_idx, end_idx = _matrix_field_bounds(headers, non_empty_headers, field_idx)
@@ -420,32 +516,50 @@ def _matrix_table_to_claims(
                 cell_text = _join_group_column(group, col_idx)
                 clean_text, urls = _resolve_footnote_urls(cell_text, block.footnotes)
                 value = _sanitize_matrix_value(clean_text)
-                if not urls or not value or value in {_clean(headers[field_idx]), category}:
+                if not value or value in {_clean(headers[field_idx]), category}:
                     continue
-                if _looks_like_broken_fragment(value) or _looks_like_broken_fragment(category):
+                if _looks_like_broken_fragment(value):
                     continue
-                metric = _matrix_metric_label(category, headers, field_idx, product_idx, note_idx)
-                claims.append(
-                    Claim(
-                        claim_id=f"{doc_id}#t{table_idx}#r{row_offset}",
-                        section_path=list(section_path),
-                        metric=_clean(metric),
-                        value=value,
-                        year=None,
-                        region=None,
-                        statement=_clean(f"{metric} {clean_text}"),
-                        source_name_raw=source_name or _source_name_from_urls(urls),
-                        source_url_hint=urls[0],
-                        source_urls=_dedupe_urls(urls),
-                        extra_source_urls=urls[1:],
-                        source_name_with_marks=source_text or None,
-                        publish_time=None,
-                        notes=None,
-                        is_forecast=False,
-                    )
-                )
                 used_columns.add(col_idx)
-                row_offset += 1
+                label = _clean(headers[field_idx])
+                kept.append((col_idx, label, clean_text, value, urls))
+
+        all_urls = _dedupe_urls([*source_col_urls, *(u for entry in kept for u in entry[4])])
+        if not all_urls:
+            continue
+        if not kept:
+            primary_value = category
+            statement = _clean(category)
+        else:
+            primary_entry = next(
+                (entry for entry in kept if product_idx is not None and entry[0] == product_idx),
+                kept[0],
+            )
+            primary_value = primary_entry[3]
+            statement_parts = [
+                f"{label}：{text}" if label else text for _, label, text, _, _ in kept
+            ]
+            statement = _clean(f"{category}｜" + "；".join(statement_parts))
+
+        claims.append(
+            Claim(
+                claim_id=f"{doc_id}#t{table_idx}#r{row_offset}",
+                section_path=list(section_path),
+                metric=_clean(category),
+                value=primary_value,
+                year=None,
+                region=None,
+                statement=statement,
+                source_name_raw=source_name or _source_name_from_urls(all_urls),
+                source_url_hint=all_urls[0],
+                source_urls=all_urls,
+                extra_source_urls=all_urls[1:],
+                source_name_with_marks=source_text or None,
+                publish_time=None,
+                notes=None,
+                is_forecast=False,
+            )
+        )
     return claims
 
 
@@ -463,9 +577,11 @@ def _merge_logical_rows(rows: list[list[str | None]], mapping: HeaderMap) -> lis
 
 
 def _header_index(headers: list[str], keywords: tuple[str, ...]) -> int | None:
-    lowered = [header.lower() for header in headers]
-    for idx, header in enumerate(lowered):
-        if any(keyword.lower() in header for keyword in keywords):
+    for idx, header in enumerate(headers):
+        if header is None:
+            continue
+        lowered = header.lower() if isinstance(header, str) else str(header).lower()
+        if any(keyword.lower() in lowered for keyword in keywords):
             return idx
     return None
 
@@ -599,10 +715,77 @@ def _matrix_metric_label(
 def _join_group_column(rows: list[list[str]], idx: int) -> str:
     parts: list[str] = []
     for row in rows:
-        value = _cell_at(row, idx)
-        if value and value not in parts:
-            parts.append(value)
+        # Handle rows with variable column counts (from PDF merged cells)
+        if idx < len(row):
+            value = _cell_at(row, idx)
+            if value and value not in parts:
+                parts.append(value)
     return _clean("".join(parts))
+
+
+def _find_content_column_by_characteristics(
+    rows: list[list[str]],
+    start_search: int = 0,
+    end_search: int | None = None,
+) -> int:
+    """智能检测内容列，基于内容特征而非位置。
+
+    查找看起来最像"政策内容"的列：
+    - 有实质内容的行数多
+    - 内容相对较长
+    - 不完全是日期、地区等特殊类型
+    """
+    if end_search is None and rows:
+        end_search = len(rows[0])
+    elif end_search is None:
+        return start_search
+
+    # 判断内容类型的关键词
+    SOURCE_KEYWORDS = {"政府", "网", "部", "机构", "报", "社", "新华", "人民", "国务院"}
+    DATE_INDICATORS = {"20", "202", "202", "年", "月", "日", "-"}
+    LOCATION_KEYWORDS = {"全国", "地区", "区域", "省", "市", "县"}
+
+    # 评分每一列
+    column_scores: dict[int, tuple[int, float, int]] = {}  # (non_empty_count, avg_len, source_penalty)
+
+    for col_idx in range(start_search, min(end_search, 20)):
+        non_empty_count = 0
+        total_length = 0
+        source_penalty = 0
+        date_like_rows = 0
+
+        for row in rows[:min(10, len(rows))]:
+            if col_idx >= len(row):
+                continue
+            cell = _clean(row[col_idx])
+            if not cell:
+                continue
+
+            non_empty_count += 1
+            compact = _compact_text(cell)
+            total_length += len(compact)
+
+            # 检查是否包含源信息关键词
+            if any(kw in compact for kw in SOURCE_KEYWORDS):
+                source_penalty += 5
+
+            # 检查是否看起来像日期
+            if any(d in compact for d in DATE_INDICATORS) and len(compact) < 20:
+                date_like_rows += 1
+
+        if non_empty_count > 0:
+            avg_len = total_length / non_empty_count
+            # 实际得分：有内容的行数 * (1 + 内容长度系数) - 源信息惩罚
+            score = non_empty_count * (1.0 + min(avg_len / 50, 1.0)) - source_penalty - (date_like_rows * 0.5)
+            column_scores[col_idx] = (non_empty_count, avg_len, source_penalty)
+
+    # 返回得分高且有足够内容的列
+    if column_scores:
+        # 优先选择有内容的行数最多的，其次选择平均长度最长的
+        best_col = max(column_scores.items(), key=lambda x: (x[1][0], x[1][1]))[0]
+        return best_col
+
+    return start_search
 
 
 def _content_indexes_between(headers: list[str], start_idx: int | None, end_idx: int) -> list[int]:
@@ -665,6 +848,9 @@ def _join_policy_cells(rows: list[list[str]], indexes) -> str:
     seen: set[str] = set()
     for row in rows:
         for idx in indexes:
+            # Handle rows with variable column counts (from PDF merged cells)
+            if idx >= len(row):
+                continue
             value = _clean_policy_cell(_cell_at(row, idx))
             compact = _compact_text(value)
             if not value or compact in seen or compact in SOURCE_NOISE:
@@ -1079,3 +1265,88 @@ def _normalize_year(value: str | None) -> str | None:
 def _clean(value: str | None) -> str:
     text = re.sub(r"\s+", " ", value or "").strip()
     return re.sub(r"(?<=[一-鿿])\s+(?=[一-鿿])", "", text)
+
+
+def _llm_normalize_table_columns(rows: list[list[str]], headers: list[str], settings=None) -> list[list[str]] | None:
+    """
+    使用 LLM 来规范化表格列映射。当PDF合并单元格导致列数不一致时调用。
+    """
+    if not settings or not hasattr(settings, "models"):
+        return None
+
+    try:
+        from openai import OpenAI
+        from .prompts import TABLE_COLUMN_MAP_SYSTEM, TABLE_COLUMN_MAP_USER
+        from .usage import record_openai_usage
+    except ImportError:
+        return None
+
+    if not rows:
+        return None
+
+    # 只在有意义的情况下调用LLM（有多种列数的行）
+    col_counts = set(len(row) for row in rows)
+    if len(col_counts) <= 1:
+        return None
+
+    try:
+        # 只用前10行作样本（避免token爆炸）
+        sample_rows = rows[:10]
+        headers_str = "\n".join(
+            f"列{i}: {h}" for i, h in enumerate(headers)
+        )
+        rows_str = "\n".join(
+            f"行{i}: {json.dumps(row, ensure_ascii=False)}"
+            for i, row in enumerate(sample_rows)
+        )
+
+        model = getattr(settings.models, "extractor", "gpt-4o-mini")
+        client = OpenAI()
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": TABLE_COLUMN_MAP_SYSTEM},
+                {
+                    "role": "user",
+                    "content": TABLE_COLUMN_MAP_USER.format(
+                        headers=headers_str,
+                        rows=rows_str
+                    )
+                },
+            ],
+            max_completion_tokens=2000,
+        )
+        record_openai_usage(settings, model, response)
+
+        result_text = (response.choices[0].message.content or "").strip()
+
+        # 尝试从markdown代码块中提取JSON
+        if result_text.startswith("```"):
+            # 移除markdown代码块包装
+            lines = result_text.split("\n")
+            json_lines = []
+            in_code_block = False
+            for line in lines:
+                if line.startswith("```"):
+                    in_code_block = not in_code_block
+                elif in_code_block or (json_lines and not line.startswith("```")):
+                    json_lines.append(line)
+            result_text = "\n".join(json_lines).strip()
+
+        # 尝试解析JSON响应
+        result_rows = json.loads(result_text)
+        if isinstance(result_rows, list) and all(isinstance(r, list) for r in result_rows):
+            # 验证列数
+            expected_cols = len(headers)
+            if all(len(r) == expected_cols for r in result_rows):
+                logger.info("LLM successfully normalized table columns")
+                return result_rows
+            else:
+                logger.warning("LLM returned rows with inconsistent column count")
+    except json.JSONDecodeError as exc:
+        logger.warning("Failed to parse LLM JSON response: %s", exc)
+    except Exception as exc:
+        logger.warning("LLM table normalization failed: %s", exc)
+        return None
+
+    return None

@@ -15,6 +15,7 @@ from .tasks import (
     owner_hash,
     path_from_storage_uri,
 )
+from .usage import read_persistent_usage
 
 
 def create_app():
@@ -110,7 +111,12 @@ def create_app():
         limit: int = 20,
         offset: int = 0,
     ):
-        return store.list_runs(owner_id, limit=limit, offset=offset)
+        tasks = store.list_runs(owner_id, limit=limit, offset=offset)
+        return [_run_payload(task, store, owner_id) for task in tasks]
+
+    @app.get("/api/usage")
+    def get_usage(owner_id: Annotated[str, Depends(current_owner)]):
+        return read_persistent_usage(settings)
 
     @app.delete("/api/runs")
     def delete_runs(owner_id: Annotated[str, Depends(current_owner)]):
@@ -122,7 +128,7 @@ def create_app():
         task = store.get_task(run_id, owner_id)
         if not task:
             raise HTTPException(status_code=404, detail="Run not found")
-        return {"run": task, "events": store.list_events(run_id, owner_id)}
+        return {"run": _run_payload(task, store, owner_id), "events": store.list_events(run_id, owner_id)}
 
     @app.get("/api/runs/{run_id}/result")
     def get_result(run_id: str, owner_id: Annotated[str, Depends(current_owner)]):
@@ -132,7 +138,7 @@ def create_app():
         if task.status != "completed":
             raise HTTPException(status_code=409, detail=f"Run is {task.status}")
         artifact = _select_artifact(store, run_id, owner_id, task.requested_format)
-        path = path_from_storage_uri(artifact.storage_uri)
+        path = _artifact_path_or_404(artifact)
         if artifact.fmt == "json":
             return _read_json(path)
         return {"artifact": artifact, "text": path.read_text(encoding="utf-8", errors="replace")}
@@ -145,7 +151,7 @@ def create_app():
         if task.status != "completed":
             raise HTTPException(status_code=409, detail=f"Run is {task.status}")
         artifact = _select_artifact(store, run_id, owner_id, fmt or task.requested_format)
-        path = path_from_storage_uri(artifact.storage_uri)
+        path = _artifact_path_or_404(artifact)
         return FileResponse(path, media_type=artifact.content_type, filename=artifact.filename)
 
     @app.get("/api/runs/{run_id}/input")
@@ -177,6 +183,25 @@ def _configured_api_keys(env_name: str) -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def _run_payload(task, store, owner_id: str) -> dict:
+    payload = task.model_dump(mode="json")
+    payload["result_available"] = _has_artifact_file(store, task.run_id, owner_id, task.requested_format)
+    payload["input_available"] = _path_exists(task.input_path)
+    usage = (task.summary or {}).get("usage") if isinstance(task.summary, dict) else None
+    payload["usage"] = usage or {
+        "calls": 0,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "estimated_cost_usd": 0.0,
+        "by_model": {},
+    }
+    payload["global_usage"] = read_persistent_usage(store.settings)
+    payload["cost_usd"] = payload["usage"].get("estimated_cost_usd", 0.0)
+    return payload
+
+
 def _select_artifact(store, run_id: str, owner_id: str, fmt: str):
     artifacts = store.list_artifacts(run_id, owner_id)
     for artifact in artifacts:
@@ -185,6 +210,32 @@ def _select_artifact(store, run_id: str, owner_id: str, fmt: str):
     from fastapi import HTTPException
 
     raise HTTPException(status_code=404, detail="Artifact not found")
+
+
+def _has_artifact_file(store, run_id: str, owner_id: str, fmt: str) -> bool:
+    try:
+        artifact = _select_artifact(store, run_id, owner_id, fmt)
+    except Exception:
+        return False
+    return _path_exists(artifact.storage_uri)
+
+
+def _path_exists(storage_uri: str | None) -> bool:
+    if not storage_uri:
+        return False
+    try:
+        return path_from_storage_uri(storage_uri).exists()
+    except Exception:
+        return False
+
+
+def _artifact_path_or_404(artifact):
+    from fastapi import HTTPException
+
+    path = path_from_storage_uri(artifact.storage_uri)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Result artifact not found on disk")
+    return path
 
 
 def _read_json(path: Path):
