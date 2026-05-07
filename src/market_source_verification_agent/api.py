@@ -1,6 +1,7 @@
 """FastAPI application for task-style source verification."""
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
@@ -35,7 +36,29 @@ def create_app():
 
     settings = load_settings()
     store = create_task_store(settings)
-    app = FastAPI(title="Market Source Verification Agent", version="0.1.0")
+    cleanup_interval_seconds = 3600  # 1 hour
+    last_cleanup_time = {"value": 0}
+    last_cleanup_result = {"value": None}
+
+    def _run_cleanup_and_store_result() -> None:
+        from .cleanup import run_cleanup
+
+        try:
+            last_cleanup_result["value"] = run_cleanup(settings, dry_run=False)
+        except Exception as exc:
+            import logging
+
+            logging.error(f"Background cleanup failed: {exc}")
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        import threading
+
+        thread = threading.Thread(target=_run_cleanup_and_store_result, daemon=True)
+        thread.start()
+        yield
+
+    app = FastAPI(title="Market Source Verification Agent", version="0.1.0", lifespan=lifespan)
 
     cors_origins = settings.web.effective_cors_origins()
     if cors_origins:
@@ -105,9 +128,6 @@ def create_app():
             background_tasks.add_task(execute_run, task.run_id, owner_id, store)
         return task
 
-    cleanup_interval_seconds = 3600  # 1 hour
-    last_cleanup_time = {"value": 0}
-
     @app.get("/api/runs")
     def list_runs(
         owner_id: Annotated[str, Depends(current_owner)],
@@ -117,18 +137,11 @@ def create_app():
         """List runs and trigger periodic cleanup."""
         import time
 
-        from .cleanup import run_cleanup
-
         # Trigger cleanup every hour in background
         now = time.time()
         if now - last_cleanup_time["value"] > cleanup_interval_seconds:
             last_cleanup_time["value"] = now
-            try:
-                run_cleanup(settings, dry_run=False)
-            except Exception as exc:
-                import logging
-
-                logging.error(f"Background cleanup failed: {exc}")
+            _run_cleanup_and_store_result()
 
         tasks = store.list_runs(owner_id, limit=limit, offset=offset)
         return [_run_payload(task, store, owner_id) for task in tasks]
@@ -136,6 +149,21 @@ def create_app():
     @app.get("/api/usage")
     def get_usage(owner_id: Annotated[str, Depends(current_owner)]):
         return read_persistent_usage(settings)
+
+    @app.get("/api/system/storage")
+    def system_storage(owner_id: Annotated[str, Depends(current_owner)]):
+        from .cleanup import count_cleanup_candidates, volume_usage
+
+        return {
+            "task_store_backend": _store_backend_name(store),
+            "configured_task_store_backend": settings.runtime.task_store_backend,
+            "mongodb_configured": bool(os.getenv(settings.mongodb.uri_env) or os.getenv("MONGODB_URL")),
+            "mongodb_connected": _mongodb_connected(store),
+            "storage_backend": settings.storage.backend,
+            "volume": volume_usage(settings),
+            "cleanup_candidates": count_cleanup_candidates(settings),
+            "last_cleanup": last_cleanup_result["value"],
+        }
 
     @app.delete("/api/runs")
     def delete_runs(owner_id: Annotated[str, Depends(current_owner)]):
@@ -197,25 +225,15 @@ def create_app():
     @app.get("/api/volume")
     def get_volume_usage():
         """Get current volume/disk usage (Railway monitoring)."""
-        from pathlib import Path
+        from .cleanup import volume_usage
 
-        from .cleanup import get_dir_size
-
-        usage = {
-            "cache_mb": get_dir_size(Path(settings.storage.cache_dir if hasattr(settings.storage, "cache_dir") else "data/cache")) / 1024 / 1024,
-            "uploads_mb": get_dir_size(Path(settings.storage.uploads_dir)) / 1024 / 1024,
-            "reports_mb": get_dir_size(Path(settings.storage.reports_dir)) / 1024 / 1024,
-        }
-        usage["total_mb"] = sum(usage.values())
-        usage["warning"] = usage["total_mb"] > 500
-        return usage
+        return volume_usage(settings)
 
     @app.post("/api/cleanup")
     def manual_cleanup():
         """Manually trigger cleanup of old runs and cache files."""
-        from .cleanup import run_cleanup
-
-        return run_cleanup(settings)
+        _run_cleanup_and_store_result()
+        return last_cleanup_result["value"]
 
     return app
 
@@ -223,6 +241,25 @@ def create_app():
 def _configured_api_keys(env_name: str) -> set[str]:
     raw = os.getenv(env_name, "")
     return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _store_backend_name(store) -> str:
+    name = type(store).__name__.lower()
+    if "mongo" in name:
+        return "mongodb"
+    if "local" in name:
+        return "local"
+    return type(store).__name__
+
+
+def _mongodb_connected(store) -> bool:
+    ping = getattr(store, "ping", None)
+    if not callable(ping):
+        return False
+    try:
+        return bool(ping())
+    except Exception:
+        return False
 
 
 def _run_payload(task, store, owner_id: str) -> dict:

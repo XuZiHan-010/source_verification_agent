@@ -133,6 +133,18 @@ class MongoTaskStore:
         )
         return [RunTask.model_validate(doc) for doc in docs]
 
+    def list_runs_for_cleanup(self, cutoff: datetime, limit: int = 100000) -> list[RunTask]:
+        docs = (
+            self.runs.find({"created_at": {"$lt": cutoff}}, {"_id": False})
+            .sort("created_at", self._ascending)
+            .limit(limit)
+        )
+        return [RunTask.model_validate(doc) for doc in docs]
+
+    def ping(self) -> bool:
+        self.client.admin.command("ping")
+        return True
+
     def delete_run(self, run_id: str, owner_id: str) -> bool:
         task = self.get_task(run_id, owner_id)
         if not task:

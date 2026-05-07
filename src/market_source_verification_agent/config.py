@@ -49,6 +49,7 @@ class CacheSettings(BaseModel):
     fetch_ttl_days: int = 30
     verify_ttl_days: int = 7
     classify_ttl_days: int = 90
+    max_total_mb: int = 300
 
 
 class OutputSettings(BaseModel):

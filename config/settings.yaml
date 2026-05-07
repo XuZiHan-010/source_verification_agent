@@ -15,6 +15,7 @@ cache:
   fetch_ttl_days:    30
   verify_ttl_days:   7
   classify_ttl_days: 90
+  max_total_mb:      300
 
 storage:
   backend:            local         # local | s3（阶段三只支持 local；多机部署再切 s3）

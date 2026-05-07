@@ -200,6 +200,26 @@ class LocalTaskStore:
         tasks.sort(key=lambda t: t.created_at or datetime.min, reverse=True)
         return tasks[offset : offset + limit]
 
+    def list_runs_for_cleanup(self, cutoff: datetime, limit: int = 100000) -> list[RunTask]:
+        tasks = []
+        for run_dir in self.root.iterdir():
+            if not run_dir.is_dir():
+                continue
+            task_path = run_dir / "run.json"
+            if not task_path.exists():
+                continue
+            try:
+                data = _read_json_text(task_path)
+                if data is None:
+                    continue
+                task = RunTask.model_validate_json(data)
+                if task.created_at and task.created_at < cutoff:
+                    tasks.append(task)
+            except Exception:
+                continue
+        tasks.sort(key=lambda t: t.created_at or datetime.min)
+        return tasks[:limit]
+
     def delete_run(self, run_id: str, owner_id: str) -> bool:
         task = self.get_task(run_id, owner_id)
         if not task:

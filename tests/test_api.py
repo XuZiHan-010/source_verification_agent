@@ -1,11 +1,14 @@
 from pathlib import Path
 import json
 import shutil
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
 
+from market_source_verification_agent.cleanup import cleanup_old_runs, enforce_cache_size_limit
 from market_source_verification_agent.config import Settings
+from market_source_verification_agent.schema import RunTask
 from market_source_verification_agent.tasks import LocalTaskStore, _write_xlsx_from_json_report, owner_hash
 
 
@@ -286,3 +289,125 @@ runtime:
     assert usage_response.status_code == 200
     assert usage_response.json()["total_tokens"] == 120
     assert usage_response.json()["estimated_cost_usd"] == 0.000027
+
+
+def test_cleanup_old_runs_uses_backend_cleanup_listing():
+    old_task = RunTask(
+        run_id="old-run",
+        owner_id="owner-1",
+        status="completed",
+        input_kind="file",
+        requested_format="xlsx",
+        current_stage="completed",
+        created_at=datetime.now() - timedelta(days=10),
+        updated_at=datetime.now() - timedelta(days=10),
+    )
+
+    class FakeStore:
+        def __init__(self):
+            self.deleted = []
+
+        def list_runs_for_cleanup(self, cutoff, limit=100000):
+            assert cutoff > datetime.now() - timedelta(days=4)
+            assert limit == 100000
+            return [old_task]
+
+        def delete_run(self, run_id, owner_id):
+            self.deleted.append((run_id, owner_id))
+            return True
+
+    store = FakeStore()
+
+    deleted = cleanup_old_runs(store, max_age_days=3)
+
+    assert deleted == 1
+    assert store.deleted == [("old-run", "owner-1")]
+
+
+def test_enforce_cache_size_limit_deletes_oldest_files():
+    cache_dir = Path.cwd() / "data" / "test_cache_limit" / uuid4().hex / "cache"
+    try:
+        cache_dir.mkdir(parents=True)
+        old = cache_dir / "old.bin"
+        newer = cache_dir / "new.bin"
+        old.write_bytes(b"a" * 900_000)
+        newer.write_bytes(b"b" * 900_000)
+        old_time = (datetime.now() - timedelta(days=2)).timestamp()
+        new_time = datetime.now().timestamp()
+        import os
+
+        os.utime(old, (old_time, old_time))
+        os.utime(newer, (new_time, new_time))
+
+        deleted = enforce_cache_size_limit(cache_dir, max_mb=1)
+
+        assert deleted == 1
+        assert not old.exists()
+        assert newer.exists()
+    finally:
+        shutil.rmtree(cache_dir.parent, ignore_errors=True)
+
+
+def test_system_storage_and_volume_use_configured_cache_dir(monkeypatch):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    monkeypatch.setenv("API_KEYS", "")
+    monkeypatch.setenv("MONGODB_URI", "")
+    monkeypatch.setenv("MONGODB_URL", "")
+    test_root = Path.cwd() / "data" / "test_storage" / uuid4().hex
+    try:
+        settings_path = test_root / "settings.yaml"
+        cache_dir = test_root / "custom-cache"
+        uploads_dir = test_root / "uploads"
+        reports_dir = test_root / "reports"
+        (cache_dir / "sources").mkdir(parents=True, exist_ok=True)
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "sources" / "source.html").write_bytes(b"x" * 1024)
+        (uploads_dir / "input.pdf").write_bytes(b"u" * 2048)
+        (reports_dir / "result.xlsx").write_bytes(b"r" * 4096)
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(
+            f"""
+cache:
+  dir: {cache_dir}
+  max_total_mb: 300
+storage:
+  uploads_dir: {uploads_dir}
+  reports_dir: {reports_dir}
+auth:
+  require_auth: false
+queue:
+  backend: local
+runtime:
+  task_store_backend: local
+""",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MARKET_SOURCE_SETTINGS", str(settings_path))
+
+        from fastapi.testclient import TestClient
+
+        from market_source_verification_agent.api import create_app
+
+        import market_source_verification_agent.api as api_module
+
+        original_load_settings = api_module.load_settings
+        api_module.load_settings = lambda: original_load_settings(settings_path)
+        try:
+            client = TestClient(create_app())
+        finally:
+            api_module.load_settings = original_load_settings
+
+        volume = client.get("/api/volume").json()
+        storage = client.get("/api/system/storage").json()
+
+        assert volume["cache_sources_mb"] > 0
+        assert volume["uploads_mb"] > 0
+        assert volume["reports_mb"] > 0
+        assert storage["task_store_backend"] == "local"
+        assert storage["mongodb_configured"] is False
+        assert storage["mongodb_connected"] is False
+        assert storage["volume"]["paths"]["cache"] == str(cache_dir)
+    finally:
+        shutil.rmtree(test_root, ignore_errors=True)
