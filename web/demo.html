@@ -418,7 +418,13 @@
   .dr-row .k { font-family: var(--mono); font-size: 10.5px; color: var(--text-3); letter-spacing: .14em; text-transform: uppercase; }
   .dr-row .v { color: var(--text); font-size: 14px; line-height: 1.6; }
   .dr-row .v.mono { font-family: var(--mono); font-size: 13px; }
-  .dr-row .v a { color: var(--tier-a); text-decoration: none; border-bottom: 1px solid var(--tier-a); }
+  .source-ref {
+    display: inline-block;
+    color: var(--tier-a);
+    border-bottom: 1px solid transparent;
+    word-break: break-all;
+    user-select: text;
+  }
 
   .quote {
     margin-top: 24px; padding: 22px 24px;
@@ -1613,10 +1619,8 @@
     <button class="filter-pill" data-filter="C">C 类来源 <span class="ct">0</span></button>
     <span class="spacer"></span>
     <div class="download-group">
-      <button class="featured">↓ XLSX</button>
-      <button>MD</button>
-      <button>HTML</button>
-      <button>JSON</button>
+      <button class="featured" data-fmt="xlsx">↓ XLSX</button>
+      <button data-fmt="json">JSON</button>
     </div>
   </div>
 
@@ -1624,7 +1628,7 @@
     <table class="report" id="report">
       <thead>
         <tr>
-          <th style="width: 56px">#</th>
+          <th style="width: 86px">Claim ID</th>
           <th>指标</th>
           <th>声明</th>
           <th>年份</th>
@@ -1692,39 +1696,170 @@ function normalizeYear(value) {
   return "";
 }
 
-function normalizeRow(row, index) {
-  const sourceUrl = row["来源URL提示"] || null;
-  const sourceUrls = (row["来源URL列表"] || sourceUrl || "")
-    .split(/\n+/)
+function safeHostname(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  try {
+    return new URL(text).hostname;
+  } catch (_) {
+    const match = text.match(/([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/);
+    return match ? match[0] : "";
+  }
+}
+
+function fileNameFromUrl(value) {
+  try {
+    const pathname = new URL(value).pathname;
+    return decodeURIComponent(pathname.split("/").filter(Boolean).pop() || "");
+  } catch (_) {
+    return "";
+  }
+}
+
+function displaySourceName(rawName, sourceUrl) {
+  const text = String(rawName ?? "").trim();
+  if (!text || /^https?:\/\//i.test(text)) {
+    return fileNameFromUrl(sourceUrl) || safeHostname(sourceUrl) || text;
+  }
+  return text;
+}
+
+function flattenResultPayload(payload) {
+  if (!Array.isArray(payload)) return [];
+  return payload.flatMap((item) => {
+    if (Array.isArray(item?.rows)) {
+      return item.rows.map((row) => ({ ...row, __sectionTitle: item.title || "", __headers: item.headers || [] }));
+    }
+    return item;
+  });
+}
+
+function normalizeKey(value) {
+  return String(value ?? "").replace(/\s+/g, "").toLowerCase();
+}
+
+function getField(row, candidates) {
+  for (const key of candidates) {
+    if (row[key] != null && String(row[key]).trim() !== "") return row[key];
+  }
+  return "";
+}
+
+function claimIdFromRow(row, index) {
+  const direct = getField(row, ["\u539f\u59cbClaimID", "\u539f\u59cb Claim ID", "Claim ID", "ClaimID", "claim_id"]);
+  if (direct) return String(direct).trim().split(/\n+/)[0];
+  for (const [key, value] of Object.entries(row)) {
+    const norm = normalizeKey(key);
+    if ((norm.includes("claimid") || norm === "\u7f16\u53f7" || norm === "\u5e8f\u53f7") && String(value ?? "").trim()) {
+      return String(value).trim().split(/\n+/)[0];
+    }
+  }
+  const duplicateIds = getField(row, ["\u539f\u59cbClaim\u5217\u8868"]);
+  return duplicateIds ? String(duplicateIds).trim().split(/\n+/)[0] : String(index + 1).padStart(2, "0");
+}
+
+function isClaimIdKey(key) {
+  const norm = normalizeKey(key);
+  return norm.includes("claimid") || norm === "\u7f16\u53f7" || norm === "\u5e8f\u53f7" || norm === "\u539f\u59cbclaimid";
+}
+
+function hasClaimIdText(value) {
+  return normalizeKey(value).includes("claimid");
+}
+
+function isSourceKey(key) {
+  const norm = normalizeKey(key);
+  return norm.includes("\u6765\u6e90") || norm.includes("source") || norm.includes("url") || norm.includes("\u94fe\u63a5");
+}
+
+function isGeneratedReportKey(key) {
+  const norm = normalizeKey(key);
+  return key.startsWith("__")
+    || ["\u6765\u6e90\u662f\u5426\u771f\u5b9e", "\u539f\u56e0", "\u6838\u9a8c\u8bca\u65ad", "\u591a\u6e90\u6838\u9a8c\u660e\u7ec6", "\u6765\u6e90\u7c7b\u522b", "\u6838\u9a8c\u4f50\u8bc1", "\u91cd\u590d\u6761\u6570", "\u539f\u59cbclaim\u5217\u8868", "\u539f\u59cbclaimid"].some((item) => norm === normalizeKey(item));
+}
+
+function metricFromRow(row) {
+  const explicit = getField(row, ["\u6307\u6807"]);
+  if (explicit && !hasClaimIdText(explicit)) return explicit;
+  const orderedKeys = Array.isArray(row.__headers) && row.__headers.length ? row.__headers : Object.keys(row);
+  const priorityLabels = [
+    "\u6280\u672f\u540d\u79f0",
+    "\u5206\u7c7b",
+    "\u653f\u7b56",
+    "\u4e8b\u4ef6",
+    "\u4f01\u4e1a",
+    "\u6307\u6807",
+    "\u9879\u76ee",
+    "\u540d\u79f0",
+  ];
+  for (const label of priorityLabels) {
+    const key = orderedKeys.find((item) => normalizeKey(item).includes(normalizeKey(label)) && !isClaimIdKey(item) && !isSourceKey(item));
+    const value = key ? row[key] : "";
+    if (value != null && String(value).trim() && !hasClaimIdText(value)) return value;
+  }
+  for (const key of orderedKeys) {
+    if (isClaimIdKey(key) || isSourceKey(key) || isGeneratedReportKey(key)) continue;
+    const value = row[key];
+    if (value != null && String(value).trim() && !hasClaimIdText(value)) return value;
+  }
+  return "\u2014";
+}
+
+function normalizeSourceUrls(values) {
+  const urls = values
+    .flatMap((value) => String(value ?? "").split(/\n+/))
     .map((item) => item.trim())
     .filter(Boolean);
-  const verdictLabel = row["来源是否真实"] || "❓ 无法验证";
+  const unique = [...new Set(urls)];
+  return unique.filter((url) => {
+    const lower = url.toLowerCase();
+    const looksComplete = /\.(pdf|html?|shtml)(?:[?#].*)?$/.test(lower);
+    return looksComplete || !unique.some((other) => other !== url && other.startsWith(url));
+  });
+}
+
+function sourceTextMarkup(urls) {
+  if (!urls.length) return `<span class="mono" style="color:var(--text-3)">// \u65e0\u53ef\u8bbf\u95ee\u94fe\u63a5</span>`;
+  return urls.map((url) => `<span class="source-ref">${escapeHtml(url)}</span>`).join("<br>");
+}
+
+function normalizeRow(row, index) {
+  const claimId = claimIdFromRow(row, index);
+  const sourceUrls = normalizeSourceUrls([
+    getField(row, ["\u6765\u6e90URL\u5217\u8868"]),
+    getField(row, ["\u6765\u6e90URL\u63d0\u793a"]),
+  ]);
+  const sourceUrl = sourceUrls[0] || getField(row, ["\u6765\u6e90URL\u63d0\u793a"]) || null;
+  const verdictLabel = getField(row, ["\u6765\u6e90\u662f\u5426\u771f\u5b9e"]) || "❓ 无法验证";
   const verdictMeta = VERDICT_META[verdictLabel] || VERDICT_META["❓ 无法验证"];
-  const sourceName = row["来源名称"] || "";
-  const domain = sourceUrl ? new URL(sourceUrl).hostname : (sourceName.match(/([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/)?.[0] || "—");
+  const sourceName = displaySourceName(getField(row, ["\u6765\u6e90\u540d\u79f0"]), sourceUrl);
+  const domain = safeHostname(sourceUrl || sourceName) || "\u2014";
   return {
-    id: row["章节"] ? `${row["章节"]}#${index + 1}` : `claim#${index + 1}`,
-    metric: row["指标"] || "—",
-    value: row["数值"] || "—",
-    displayStatement: row["事实声明"] || row["数值"] || "—",
-    year: normalizeYear(row["年份"]),
-    region: row["地区/口径"] || "—",
-    src: sourceName || "—",
+    id: claimId,
+    claimId,
+    metric: metricFromRow(row),
+    value: getField(row, ["\u6570\u503c"]) || "\u2014",
+    displayStatement: getField(row, ["\u4e8b\u5b9e\u58f0\u660e", "\u6570\u503c"]) || "\u2014",
+    year: normalizeYear(getField(row, ["\u5e74\u4efd"])),
+    region: getField(row, ["\u5730\u533a/\u53e3\u5f84"]) || "\u2014",
+    src: sourceName || "\u2014",
     domain,
     verdictLabel,
     verdictClass: verdictMeta.cls,
     verdictKey: verdictMeta.key,
-    tier: row["来源类别"] || "C",
-    quote: row["核验佐证"] || null,
-    locator: sourceUrl ? domain : "—",
-    reasoning: row["核验佐证"] || row["事实声明"] || "—",
+    tier: getField(row, ["\u6765\u6e90\u7c7b\u522b"]) || "C",
+    quote: ["supported", "partial", "contradicted"].includes(verdictMeta.key) ? getField(row, ["\u6838\u9a8c\u4f50\u8bc1"]) || null : null,
+    locator: sourceUrl ? domain : "\u2014",
+    reasoning: ["supported", "partial", "contradicted"].includes(verdictMeta.key)
+      ? getField(row, ["\u6838\u9a8c\u4f50\u8bc1", "\u4e8b\u5b9e\u58f0\u660e"]) || "\u2014"
+      : getField(row, ["\u6838\u9a8c\u8bca\u65ad", "\u539f\u56e0", "\u591a\u6e90\u6838\u9a8c\u660e\u7ec6"]) || "\u2014",
     url: sourceUrl,
     urls: sourceUrls,
-    duplicateCount: row["重复条数"] || "1",
-    duplicateIds: row["原始Claim列表"] || "",
-    diagnosis: row["核验诊断"] || row["核验佐证"] || row["多源核验明细"] || "",
-    sourceDetails: row["多源核验明细"] || "",
-    statement: row["事实声明"] || "",
+    duplicateCount: getField(row, ["\u91cd\u590d\u6761\u6570"]) || "1",
+    duplicateIds: getField(row, ["\u539f\u59cbClaim\u5217\u8868"]) || "",
+    diagnosis: getField(row, ["\u6838\u9a8c\u8bca\u65ad", "\u6838\u9a8c\u4f50\u8bc1", "\u591a\u6e90\u6838\u9a8c\u660e\u7ec6"]),
+    sourceDetails: getField(row, ["\u591a\u6e90\u6838\u9a8c\u660e\u7ec6"]),
+    statement: getField(row, ["\u4e8b\u5b9e\u58f0\u660e"]),
   };
 }
 
@@ -1748,7 +1883,7 @@ function renderTable() {
     const tr = document.createElement("tr");
     if (flagged) tr.classList.add("flagged");
     tr.innerHTML = `
-      <td><span class="row-id">${String(index + 1).padStart(2, "0")}</span></td>
+      <td><span class="row-id">${escapeHtml(row.claimId)}</span></td>
       <td><span class="metric">${escapeHtml(row.metric)}</span></td>
       <td><span class="num">${escapeHtml(row.displayStatement)}</span></td>
       <td><span class="year">${escapeHtml(row.year)}</span></td>
@@ -1768,9 +1903,7 @@ function renderTable() {
 function openDrawer(row) {
   document.getElementById("drawer-id").textContent = "声明 " + row.id;
   const body = document.getElementById("drawer-body");
-  const links = row.urls.length
-    ? row.urls.map((url) => `<a href="${escapeHtml(url)}" target="_blank">${escapeHtml(url)}</a>`).join("<br>")
-    : (row.url ? `<a href="${row.url}" target="_blank">${escapeHtml(row.url)}</a>` : `<span class="mono" style="color:var(--text-3)">// 无可访问链接</span>`);
+  const links = sourceTextMarkup(row.urls.length ? row.urls : (row.url ? [row.url] : []));
   body.innerHTML = `
     <div class="dr-row"><div class="k">指标</div><div class="v">${escapeHtml(row.metric)}</div></div>
     <div class="dr-row"><div class="k">声明</div><div class="v">${escapeHtml(row.statement || row.displayStatement)}</div></div>
@@ -2011,7 +2144,7 @@ async function loadResult(runId) {
   const response = await fetchWithAuth(`${API_BASE}/api/runs/${runId}/result`);
   if (!response.ok) throw new Error(await response.text());
   const payload = await response.json();
-  currentRows = payload.map(normalizeRow);
+  currentRows = flattenResultPayload(payload).map(normalizeRow);
   updateFilterCounts();
   renderTable();
   setSummary(currentRun.summary || {});
@@ -2020,22 +2153,18 @@ async function loadResult(runId) {
 
 function bindDownloads(runId) {
   downloadButtons.forEach((button) => {
-    const label = button.textContent.trim().replace("↓ ", "").toLowerCase();
-    button.disabled = label !== "json";
-    button.title = label === "json" ? "下载当前结构化结果" : "当前前端结果视图默认生成 JSON；其他格式可通过 CLI 或后端扩展生成";
+    const label = button.dataset.fmt || "json";
+    button.disabled = false;
+    button.title = label === "xlsx" ? "下载 Excel 报告" : "下载结构化 JSON";
     button.onclick = async () => {
-      if (label !== "json") {
-        alert("当前页面默认生成 JSON 结果；XLSX / MD / HTML 下载入口可以下一步再补成按需导出。");
-        return;
-      }
       try {
-        const response = await fetchWithAuth(`${API_BASE}/api/runs/${runId}/download?fmt=json`);
+        const response = await fetchWithAuth(`${API_BASE}/api/runs/${runId}/download?fmt=${encodeURIComponent(label)}`);
         if (!response.ok) throw new Error("下载失败");
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `verification-${runId}.json`;
+        a.download = `verification-${runId}.${label}`;
         a.click();
         URL.revokeObjectURL(url);
       } catch (error) {

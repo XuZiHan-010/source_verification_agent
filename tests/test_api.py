@@ -1,7 +1,12 @@
 from pathlib import Path
+import json
+import shutil
 from uuid import uuid4
 
 import pytest
+
+from market_source_verification_agent.config import Settings
+from market_source_verification_agent.tasks import LocalTaskStore, _write_xlsx_from_json_report, owner_hash
 
 
 def test_fastapi_text_run_smoke(monkeypatch):
@@ -70,6 +75,70 @@ runtime:
 
     missing = client.get(f"/api/runs/{run_id}")
     assert missing.status_code == 404
+
+
+def test_local_task_store_ignores_empty_run_json():
+    test_root = Path.cwd() / "data" / "test_task_store" / uuid4().hex
+    settings = Settings(storage={"uploads_dir": str(test_root / "uploads"), "reports_dir": str(test_root / "reports")})
+    try:
+        store = LocalTaskStore(settings)
+        owner_id = owner_hash("anonymous-local-dev")
+        run_id = "empty-run"
+        run_dir = store.root / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text("", encoding="utf-8")
+
+        assert store.get_task(run_id, owner_id) is None
+        assert store.list_events(run_id, owner_id) == []
+    finally:
+        shutil.rmtree(test_root, ignore_errors=True)
+
+
+def test_local_task_store_writes_parseable_task_json():
+    test_root = Path.cwd() / "data" / "test_task_store" / uuid4().hex
+    settings = Settings(storage={"uploads_dir": str(test_root / "uploads"), "reports_dir": str(test_root / "reports")})
+    try:
+        store = LocalTaskStore(settings)
+        owner_id = owner_hash("anonymous-local-dev")
+
+        task = store.create_run(owner_id, "text", "json", False)
+        task.status = "running"
+        store.save_task(task)
+
+        loaded = store.get_task(task.run_id, owner_id)
+        assert loaded is not None
+        assert loaded.status == "running"
+    finally:
+        shutil.rmtree(test_root, ignore_errors=True)
+
+
+def test_json_report_can_be_exported_to_xlsx():
+    pytest.importorskip("openpyxl")
+    test_root = Path.cwd() / "data" / "test_task_store" / uuid4().hex
+    source_path = test_root / "result.json"
+    target_path = test_root / "result.xlsx"
+    try:
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "title": "核验报告",
+                        "headers": ["Claim ID", "指标", "来源类别"],
+                        "rows": [{"Claim ID": "T11", "指标": "技术名称", "来源类别": "C"}],
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        _write_xlsx_from_json_report(source_path, target_path)
+
+        assert target_path.exists()
+        assert target_path.stat().st_size > 0
+    finally:
+        shutil.rmtree(test_root, ignore_errors=True)
 
 
 def test_fastapi_delete_all_runs(monkeypatch):

@@ -37,6 +37,22 @@ def render(
     fmt: ReportFormat = "xlsx",
     detailed: bool = False,
 ) -> bytes:
+    # 新格式（ClaimID 表）走分块输出：每个 sub-table 各自的列头 + 来源是否真实/类别
+    new_format_claims = [c for c in claims if c.original_columns]
+    if new_format_claims and len(new_format_claims) == len(claims):
+        sections = _report_sections(claims, verifies, classes, detailed)
+        if fmt == "json":
+            return json.dumps([
+                {"title": s["title"], "headers": s["headers"], "rows": s["rows"]}
+                for s in sections
+            ], ensure_ascii=False, indent=2).encode("utf-8")
+        if fmt == "md":
+            return _render_md_sections(sections, detailed).encode("utf-8")
+        if fmt == "html":
+            return _render_html_sections(sections, detailed).encode("utf-8")
+        return _render_xlsx_sections(sections, detailed)
+
+    # 兼容旧格式（数值表 / 段落 claim）
     rows = _report_rows(claims, verifies, classes, detailed)
     if fmt == "json":
         return json.dumps(rows, ensure_ascii=False, indent=2).encode("utf-8")
@@ -45,6 +61,144 @@ def render(
     if fmt == "html":
         return _render_html(rows, detailed).encode("utf-8")
     return _render_xlsx(rows, detailed)
+
+
+def _report_sections(
+    claims: list[Claim],
+    verifies: dict[str, VerifyResult],
+    classes: dict[str, ClassifyResult],
+    detailed: bool,
+) -> list[dict]:
+    """按 sub-table 分组：同 table_signature 的 claim 一组。每组各自列头 + 追加 2 列。"""
+    grouped: dict[str, list[Claim]] = {}
+    order: list[str] = []
+    for c in claims:
+        sig = c.table_signature or "_default"
+        if sig not in grouped:
+            grouped[sig] = []
+            order.append(sig)
+        grouped[sig].append(c)
+
+    sections = []
+    for sig in order:
+        group = grouped[sig]
+        # 列名：保持首条 claim 的 original_columns 顺序（同 sub-table 顺序一致）
+        first_oc = group[0].original_columns or {}
+        col_names: list[str] = list(first_oc.keys())
+        # 合并补齐：以防某些 claim 多出新列
+        for c in group[1:]:
+            for k in (c.original_columns or {}):
+                if k not in col_names:
+                    col_names.append(k)
+        appended = ["来源是否真实", "原因", "核验诊断", "多源核验明细", "来源类别"]
+        if detailed:
+            appended.append("核验佐证")
+        headers = col_names + appended
+
+        rows = []
+        for c in group:
+            verify = verifies.get(c.claim_id)
+            category = classes.get(c.claim_id)
+            row: dict[str, str] = {}
+            for col in col_names:
+                row[col] = (c.original_columns or {}).get(col, "")
+            row["原始ClaimID"] = c.original_claim_id or c.claim_id
+            row["来源名称"] = c.source_name_raw
+            row["来源URL提示"] = c.source_url_hint or ""
+            row["来源URL列表"] = "\n".join(c.source_urls or [url for url in [c.source_url_hint, *c.extra_source_urls] if url])
+            row["来源是否真实"] = VERDICT_LABELS[verify.verdict] if verify else "❓ 无法验证"
+            row["原因"] = _diagnosis_summary(verify) if verify else ""
+            row["核验诊断"] = _diagnosis_summary(verify) if verify else ""
+            row["多源核验明细"] = _source_details_text(verify) if verify else ""
+            row["来源类别"] = category.tier if category else ""
+            if detailed:
+                row["核验佐证"] = _detail_text(verify, category) if verify and category else ""
+            rows.append(row)
+
+        # 节标题：用 sub-table 列签名前 N 个非空列名拼出
+        title = " / ".join([n for n in col_names if n][:4])
+        sections.append({"title": title or "sub-table", "headers": headers, "rows": rows})
+    return sections
+
+
+def _render_xlsx_sections(sections: list[dict], detailed: bool) -> bytes:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+    except ImportError as exc:
+        raise RuntimeError("xlsx output requires openpyxl") from exc
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "source_verification"
+    section_title_font = Font(bold=True, size=12)
+
+    for section in sections:
+        # Section title row
+        ws.append([f"【{section['title']}】"])
+        ws.cell(row=ws.max_row, column=1).font = section_title_font
+        # Header row
+        ws.append(section["headers"])
+        for cell in ws[ws.max_row]:
+            cell.font = Font(bold=True)
+        # Data rows
+        for row in section["rows"]:
+            values = [row.get(h, "") for h in section["headers"]]
+            ws.append(values)
+            verdict_idx = section["headers"].index("来源是否真实") + 1
+            verdict_cell = ws.cell(row=ws.max_row, column=verdict_idx)
+            verdict_key = _verdict_key(str(verdict_cell.value))
+            verdict_cell.fill = PatternFill(fill_type="solid", fgColor=FILL_COLORS.get(verdict_key, "FFFFFF"))
+        ws.append([])  # 空行分隔
+
+    # 列宽合理默认
+    for col_idx in range(1, ws.max_column + 1):
+        ws.column_dimensions[ws.cell(row=2, column=col_idx).column_letter].width = 24
+
+    stream = io.BytesIO()
+    wb.save(stream)
+    return stream.getvalue()
+
+
+def _render_md_sections(sections: list[dict], detailed: bool) -> str:
+    out = []
+    for section in sections:
+        out.append(f"## {section['title']}\n")
+        headers = section["headers"]
+        out.append("| " + " | ".join(headers) + " |")
+        out.append("| " + " | ".join("---" for _ in headers) + " |")
+        for row in section["rows"]:
+            out.append("| " + " | ".join(_md_cell(row.get(h, "")) for h in headers) + " |")
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def _render_html_sections(sections: list[dict], detailed: bool) -> str:
+    body_parts = []
+    for section in sections:
+        body_parts.append(f"<h2>{html.escape(section['title'])}</h2>")
+        head = "".join(f"<th>{html.escape(h)}</th>" for h in section["headers"])
+        rows_html = []
+        for row in section["rows"]:
+            cells = "".join(f"<td>{html.escape(str(row.get(h, '') or ''))}</td>" for h in section["headers"])
+            rows_html.append(f"<tr>{cells}</tr>")
+        body_parts.append(
+            f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(rows_html)}</tbody></table>"
+        )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>来源核验报告</title>
+<style>
+body{{font-family:Arial,"Microsoft YaHei",sans-serif;margin:24px;color:#17202a}}
+h2{{margin-top:32px;color:#1f3a5f}}
+table{{border-collapse:collapse;width:100%;font-size:14px;margin-bottom:24px}}
+th,td{{border:1px solid #d7dde5;padding:8px;vertical-align:top}}
+th{{background:#f4f6f8;text-align:left}}
+tr:nth-child(even){{background:#fbfcfd}}
+</style>
+{''.join(body_parts)}
+</html>"""
 
 
 def summarize(verifies: dict[str, VerifyResult], classes: dict[str, ClassifyResult]) -> dict[str, int]:
@@ -219,7 +373,15 @@ def _headers(detailed: bool) -> list[str]:
 
 
 def _detail_text(verify: VerifyResult, category: ClassifyResult) -> str:
-    parts = [verify.evidence_quote, verify.evidence_locator, verify.discrepancy, verify.reasoning, category.tier_reason]
+    if verify.verdict in {"not_found", "not_verifiable"}:
+        return _diagnosis_summary(verify)
+    parts = [
+        _clean_detail_piece(verify.evidence_quote),
+        verify.evidence_locator,
+        verify.discrepancy,
+        _clean_detail_piece(verify.reasoning),
+        category.tier_reason,
+    ]
     return "；".join(part for part in parts if part)
 
 
@@ -237,6 +399,12 @@ def _source_details_text(verify: VerifyResult) -> str:
         diagnosis = _diagnose_detail(detail)
         reason = detail.get("reasoning") or ""
         quote = detail.get("evidence_quote") or ""
+        if verdict in {"not_found", "not_verifiable"}:
+            reason = ""
+            quote = ""
+        else:
+            reason = _clean_detail_piece(str(reason))
+            quote = _clean_detail_piece(str(quote))
         lines.append(
             f"{idx}. [{tier}/{verdict}/{status}/{content_type}/{method}] {url}\n"
             f"诊断：{diagnosis}\n"
@@ -244,6 +412,18 @@ def _source_details_text(verify: VerifyResult) -> str:
             f"{reason}".strip()
         )
     return "\n\n".join(lines)
+
+
+def _clean_detail_piece(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", "", text)
+    signal_count = sum(1 for token in ("#", "$", "{", "}", "_", "&amp;", "锛", "鈥") if token in text)
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+    if len(compact) > 40 and signal_count >= 3 and cjk_count < len(compact) * 0.25:
+        return ""
+    return text
 
 
 def _diagnosis_summary(verify: VerifyResult) -> str:

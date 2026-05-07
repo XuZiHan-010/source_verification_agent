@@ -64,11 +64,11 @@ def create_app():
 
     @app.get("/")
     def demo_page():
-        return FileResponse(ROOT / "web" / "demo.html")
+        return FileResponse(ROOT / "web" / "demo.html", headers={"Cache-Control": "no-store"})
 
     @app.get("/web/demo.html")
     def demo_page_alias():
-        return FileResponse(ROOT / "web" / "demo.html")
+        return FileResponse(ROOT / "web" / "demo.html", headers={"Cache-Control": "no-store"})
 
     @app.post("/api/runs")
     async def create_run_endpoint(
@@ -241,7 +241,108 @@ def _artifact_path_or_404(artifact):
 def _read_json(path: Path):
     import json
 
-    return json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return _flatten_sectioned_result(payload)
+
+
+def _flatten_sectioned_result(payload):
+    if not isinstance(payload, list) or not any(isinstance(item, dict) and isinstance(item.get("rows"), list) for item in payload):
+        return payload
+
+    rows = []
+    for section_idx, section in enumerate(payload, start=1):
+        if not isinstance(section, dict):
+            continue
+        title = str(section.get("title") or f"section {section_idx}")
+        for row_idx, row in enumerate(section.get("rows") or [], start=1):
+            if not isinstance(row, dict):
+                continue
+            rows.append(_section_row_to_legacy_row(row, title, section_idx, row_idx))
+    return rows
+
+
+def _section_row_to_legacy_row(row: dict, section_title: str, section_idx: int, row_idx: int) -> dict:
+    claim_id = _first_matching_value(row, ("claimid", "id", "编号", "序号")) or f"S{section_idx}R{row_idx}"
+    source_text = _first_matching_value(row, ("来源url", "来源", "来源名称", "source"))
+    detail_text = str(row.get("多源核验明细") or "")
+    urls = _dedupe(_extract_urls(source_text) + _extract_urls(detail_text))
+    source_name = _strip_urls(source_text).strip() or (urls[0] if urls else "")
+    skipped = {"来源是否真实", "原因", "核验诊断", "多源核验明细", "来源类别", "核验佐证"}
+    statement_parts = []
+    original_parts = []
+
+    for key, value in row.items():
+        text = str(value or "").strip()
+        if not text or key in skipped:
+            continue
+        original_parts.append(f"{key}: {text}")
+        normalized = _normalize_header(key)
+        if normalized in {"claimid", "id", "编号", "序号"} or "来源" in normalized or "source" in normalized:
+            continue
+        statement_parts.append(f"{key}: {text}")
+
+    statement = "；".join(statement_parts) or "；".join(original_parts) or claim_id
+    diagnosis = row.get("核验诊断") or row.get("原因") or row.get("多源核验明细") or ""
+    out = {
+        "章节": section_title,
+        "指标": section_title,
+        "数值": "",
+        "年份": _first_matching_value(row, ("年份", "时间", "日期", "year")),
+        "地区/口径": _first_matching_value(row, ("地区", "口径", "区域", "region")),
+        "事实声明": statement,
+        "来源名称": source_name,
+        "来源URL提示": urls[0] if urls else "",
+        "来源URL列表": "\n".join(urls),
+        "重复条数": "1",
+        "原始Claim列表": claim_id,
+        "核验诊断": diagnosis,
+        "多源核验明细": detail_text,
+        "来源是否真实": row.get("来源是否真实") or "❓ 无法验证",
+        "来源类别": row.get("来源类别") or "C",
+        "原始列": "\n".join(original_parts),
+    }
+    if row.get("核验佐证"):
+        out["核验佐证"] = row.get("核验佐证")
+    return out
+
+
+def _normalize_header(value: str) -> str:
+    import re
+
+    return re.sub(r"\s+", "", str(value or "")).lower()
+
+
+def _first_matching_value(row: dict, needles: tuple[str, ...]) -> str:
+    normalized_needles = tuple(_normalize_header(item) for item in needles)
+    for key, value in row.items():
+        normalized = _normalize_header(key)
+        if any(needle == normalized or needle in normalized for needle in normalized_needles):
+            text = str(value or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _extract_urls(value: str) -> list[str]:
+    import re
+
+    return [match.rstrip(").,;，。；") for match in re.findall(r"https?://[^\s<>\"')，。；;]+", str(value or ""))]
+
+
+def _strip_urls(value: str) -> str:
+    import re
+
+    return re.sub(r"https?://[^\s<>\"')，。；;]+", "", str(value or ""))
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for value in values:
+        if value and value not in seen:
+            out.append(value)
+            seen.add(value)
+    return out
 
 
 app = create_app()

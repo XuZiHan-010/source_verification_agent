@@ -104,6 +104,8 @@ def extract_claims(ir: IR, limit: int | None = None, settings=None) -> list[Clai
     section_path: list[str] = []
     table_idx = 0
     para_idx = 0
+    last_claim_id_headers: list[str] | None = None  # 续表场景的 headers 继承
+    has_claim_id_tables = False
 
     for block in ir.blocks:
         if block.type == "heading" and block.text:
@@ -111,8 +113,19 @@ def extract_claims(ir: IR, limit: int | None = None, settings=None) -> list[Clai
             section_path = section_path[: level - 1] + [block.text.strip()]
         elif block.type == "table" and block.rows:
             table_idx += 1
-            claims.extend(_table_to_claims(ir.doc_id, table_idx, block, section_path, settings=settings))
+            new_claims, last_claim_id_headers = _table_to_claims(
+                ir.doc_id, table_idx, block, section_path,
+                settings=settings,
+                inherited_claim_id_headers=last_claim_id_headers,
+            )
+            if any(c.original_columns for c in new_claims):
+                has_claim_id_tables = True
+            claims.extend(new_claims)
         elif block.type in {"paragraph", "list"} and block.text:
+            # 当 PDF 含 ClaimID 表时，paragraph 大概率是表格物理切碎产生的乱码碎片，
+            # 不应被当 claim 抽取（避免污染报告）
+            if has_claim_id_tables:
+                continue
             para_idx += 1
             claim = _paragraph_to_claim(ir.doc_id, para_idx, block.text, section_path)
             if claim:
@@ -120,29 +133,62 @@ def extract_claims(ir: IR, limit: int | None = None, settings=None) -> list[Clai
         if limit and len(claims) >= limit:
             return claims[:limit]
 
+    # 兜底过滤：若识别到 ClaimID 表，所有 paragraph claim 都是表格碎片噪声，丢弃
+    if has_claim_id_tables:
+        claims = [c for c in claims if c.original_columns]
+
     if not claims:
         raise NoClaimsFound("No claims with source information were found")
     return claims
 
 
-def _table_to_claims(doc_id: str, table_idx: int, block: Block, section_path: list[str], settings=None) -> list[Claim]:
+def _table_to_claims(
+    doc_id: str,
+    table_idx: int,
+    block: Block,
+    section_path: list[str],
+    settings=None,
+    inherited_claim_id_headers: list[str] | None = None,
+) -> tuple[list[Claim], list[str] | None]:
+    """返回 (claims, last_claim_id_headers)；后者供下一个 block 续表继承。"""
     rows = [row for row in block.rows or [] if any(_clean(cell) for cell in row)]
-    if len(rows) < 2:
-        return []
+    if len(rows) < 1:
+        return [], inherited_claim_id_headers
 
-    header_idx = _find_header_row(rows)
-    headers = [_clean(cell) for cell in rows[header_idx]]
+    # 续表检测：当前 block 的 row 0 第 0 列已经是 ClaimID 数据 → 它没自己的 header，沿用上一个 ClaimID 表的 header
+    first_cell_norm = _normalize_claim_id_cell(rows[0][0]) if rows[0] else ""
+    is_continuation_data = (
+        bool(_CLAIM_ID_RE.match(first_cell_norm))
+        and inherited_claim_id_headers is not None
+    )
+    if is_continuation_data:
+        headers = list(inherited_claim_id_headers)
+        data_rows_raw = rows
+    else:
+        if len(rows) < 2:
+            return [], inherited_claim_id_headers
+        # ClaimID 表的 header 优先：若 row 0 第 0 列含 'ClaimID/编号/ID/序号'，
+        # 直接以 row 0 当 header（避免 _find_header_row 把含 '规模/数据' 的数据行误判）
+        first_cell_norm_lower = _normalize_claim_id_cell(rows[0][0]).lower() if rows[0] else ""
+        if any(kw in first_cell_norm_lower for kw in _CLAIM_ID_HEADER_KEYWORDS):
+            header_idx = 0
+        else:
+            header_idx = _find_header_row(rows)
+        headers = [_clean(cell) for cell in rows[header_idx]]
+        data_rows_raw = rows[header_idx + 1 :]
+
+    # 新格式优先：ClaimID + 任意列 + URL
+    if _looks_like_claim_id_table(headers, data_rows_raw):
+        out = _claim_id_table_to_claims(doc_id, table_idx, data_rows_raw, headers, block, section_path)
+        return out, headers
+
     mapping = _map_headers(headers)
-    if _looks_like_policy_table(headers):
-        return _policy_table_to_claims(doc_id, table_idx, rows[header_idx + 1 :], headers, block, section_path, settings=settings)
-    if _looks_like_regulatory_table(headers):
-        return _regulatory_table_to_claims(doc_id, table_idx, rows[header_idx + 1 :], headers, block, section_path, settings=settings)
-    if _looks_like_matrix_table(headers):
-        return _matrix_table_to_claims(doc_id, table_idx, rows[header_idx + 1 :], headers, block, section_path, settings=settings)
-    data_rows = _merge_logical_rows(rows[header_idx + 1 :], mapping)
+    # 注：policy/regulatory/matrix 三条专用路径已废弃。新格式（ClaimID 表）走上面的 _claim_id_table_to_claims；
+    # 其它任意结构表格走下面的 generic 路径（_merge_logical_rows + 行级 metric/value 抽取）。
+    data_rows = _merge_logical_rows(data_rows_raw, mapping)
     claims: list[Claim] = []
 
-    for row_offset, row in enumerate(data_rows, start=header_idx + 2):
+    for row_offset, row in enumerate(data_rows, start=2):
         cells = [_clean(cell) for cell in row]
         if not any(cells) or _is_non_claim_row(cells, mapping):
             continue
@@ -196,7 +242,7 @@ def _table_to_claims(doc_id: str, table_idx: int, block: Block, section_path: li
                 is_forecast=is_forecast,
             )
         )
-    return claims
+    return claims, inherited_claim_id_headers
 
 
 def _paragraph_to_claim(doc_id: str, para_idx: int, text: str, section_path: list[str]) -> Claim | None:
@@ -1219,19 +1265,35 @@ def _is_valid_source_candidate(value: str | None) -> bool:
     return len(re.findall(r"[\u4e00-\u9fff]", text)) >= 6
 
 
+_URL_TRAILING_CHARS = " \t\r\n).,;，。、"
+_URL_SAFE_SEGMENT_RE = re.compile(r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
+
+
 def _dedupe_urls(values: list[str | None]) -> list[str]:
     urls: list[str] = []
     seen = set()
     for value in values:
+        value = _normalize_source_url(value)
         if not value:
             continue
         if value not in seen:
             urls.append(value)
             seen.add(value)
-    return urls
+    return _drop_url_fragments(urls)
 
 
-def _extract_url(text: str | None) -> str | None:
+def _drop_url_fragments(urls: list[str]) -> list[str]:
+    complete_suffixes = (".pdf", ".html", ".htm", ".shtml")
+    kept: list[str] = []
+    for url in urls:
+        lower = url.lower()
+        if not lower.endswith(complete_suffixes) and any(other != url and other.startswith(url) for other in urls):
+            continue
+        kept.append(url)
+    return kept
+
+
+def _extract_url_legacy(text: str | None) -> str | None:
     if not text:
         return None
     match = re.search(r"https?://[^\s)）\]]+", text)
@@ -1239,6 +1301,72 @@ def _extract_url(text: str | None) -> str | None:
         return match.group(0)
     domain = re.search(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b", text)
     return domain.group(0) if domain else None
+
+
+def _extract_url(text: str | None) -> str | None:
+    urls = _extract_urls(text)
+    if urls:
+        return urls[0]
+    if not text:
+        return None
+    domain = re.search(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b", text)
+    return domain.group(0) if domain else None
+
+
+def _extract_urls(text: str | None) -> list[str]:
+    if not text:
+        return []
+    urls: list[str] = []
+    for match in re.finditer(r"https?://", text):
+        urls.append(_scan_url_at(text, match.start()))
+    return _dedupe_urls(urls)
+
+
+def _scan_url_at(text: str, start: int) -> str:
+    chars: list[str] = []
+    idx = start
+    while idx < len(text):
+        char = text[idx]
+        if char.isspace():
+            next_idx = idx
+            while next_idx < len(text) and text[next_idx].isspace():
+                next_idx += 1
+            if _looks_like_wrapped_url_segment(_next_nonspace_segment(text, next_idx)):
+                idx = next_idx
+                continue
+            break
+        if char in "<>\"'":
+            break
+        chars.append(char)
+        idx += 1
+    return _normalize_source_url("".join(chars)) or ""
+
+
+def _next_nonspace_segment(text: str, start: int) -> str:
+    idx = start
+    while idx < len(text) and not text[idx].isspace() and text[idx] not in "<>\"'":
+        idx += 1
+    return text[start:idx].strip(_URL_TRAILING_CHARS)
+
+
+def _looks_like_wrapped_url_segment(segment: str) -> bool:
+    if not segment or segment.startswith(("http://", "https://")):
+        return False
+    if not _URL_SAFE_SEGMENT_RE.fullmatch(segment):
+        return False
+    return bool(re.search(r"[/.?&=#%_-]|\d", segment) or len(segment) <= 4)
+
+
+def _normalize_source_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.strip().strip("<>").strip(_URL_TRAILING_CHARS)
+    if not text:
+        return None
+    if text.startswith(("http://", "https://")):
+        text = re.sub(r"[\r\n\t\f\v]+", "", text)
+        text = re.sub(r"(?<=\S) (?=[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*(?:\d|[/.?&=#%_-]))", "", text)
+    return text.strip(_URL_TRAILING_CHARS) or None
 
 
 def _extract_parenthetical_source(text: str) -> str | None:
@@ -1350,3 +1478,291 @@ def _llm_normalize_table_columns(rows: list[list[str]], headers: list[str], sett
         return None
 
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ClaimID 表抽取路径（新格式：第 1 列是 ClaimID + 某列是 URL 来源）
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 通用 ClaimID 形式：1~3 个大写字母 + 1~3 位数字。覆盖 M1/T1/E1/F1/P1/D1/C1/R1/EV1/RQ1/S1/G1 …
+_CLAIM_ID_RE = re.compile(r"^[A-Z]{1,3}\d{1,3}$")
+_CLAIM_ID_HEADER_KEYWORDS = ("claimid", "claim id", "编号", "序号")
+_SOURCE_URL_HEADER_KEYWORDS = ("来源", "出处", "source", "链接", "url", "网址")
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _normalize_claim_id_cell(cell: str | None) -> str:
+    """PDF 把窄列里 'T1' 切成 'T\\n1'，'EV1' 切成 'EV\\n1' 这种很常见。
+    去掉所有空白和换行后再判断。"""
+    if not cell:
+        return ""
+    return re.sub(r"\s+", "", cell)
+
+
+def _detect_claim_id_column(headers: list[str], data_rows: list[list[str | None]]) -> int | None:
+    """判定首列是否为 ClaimID 列。返回 0 或 None。"""
+    if not headers:
+        return None
+    first_header_norm = _normalize_claim_id_cell(headers[0]).lower()
+    if any(kw in first_header_norm for kw in _CLAIM_ID_HEADER_KEYWORDS):
+        return 0
+
+    # 兜底：扫前 N 行第 0 列，≥80% 形如 ^[A-Z]{1,3}\d{1,3}$
+    sample = []
+    for row in data_rows[:20]:
+        if not row:
+            continue
+        cell = row[0] if len(row) > 0 else ""
+        norm = _normalize_claim_id_cell(cell)
+        if norm:
+            sample.append(norm)
+    if not sample:
+        return None
+    matches = sum(1 for s in sample if _CLAIM_ID_RE.match(s))
+    if matches / len(sample) >= 0.8:
+        return 0
+    return None
+
+
+def _detect_source_url_column(headers: list[str], data_rows: list[list[str | None]]) -> int | None:
+    """找到含 URL 的「来源」列。"""
+    n_cols = max((len(r) for r in data_rows), default=0)
+    if n_cols == 0:
+        n_cols = len(headers)
+
+    # 1. 表头匹配「来源/出处/source/链接/url」+ 该列至少 1 行含 https?://
+    candidates = []
+    for idx, h in enumerate(headers[:n_cols]):
+        header_norm = _normalize_claim_id_cell(h).lower()
+        if any(kw in header_norm for kw in _SOURCE_URL_HEADER_KEYWORDS):
+            has_url = any(
+                _URL_RE.search(row[idx] or "") for row in data_rows if idx < len(row)
+            )
+            if has_url:
+                candidates.append(idx)
+    if candidates:
+        return candidates[0]
+
+    # 2. 兜底：任意列单元格 ≥50% 含 https?://
+    for idx in range(n_cols):
+        non_empty = 0
+        with_url = 0
+        for row in data_rows:
+            if idx >= len(row):
+                continue
+            cell = (row[idx] or "").strip()
+            if cell:
+                non_empty += 1
+                if _URL_RE.search(cell):
+                    with_url += 1
+        if non_empty >= 2 and with_url / max(non_empty, 1) >= 0.5:
+            return idx
+
+    return None
+
+
+def _looks_like_claim_id_table(headers: list[str], data_rows: list[list[str | None]]) -> bool:
+    """同时满足：首列是 ClaimID 列 + 存在 URL 来源列。"""
+    if _detect_claim_id_column(headers, data_rows) is None:
+        return False
+    if _detect_source_url_column(headers, data_rows) is None:
+        return False
+    return True
+
+
+def _merge_rows_by_claim_id(
+    rows: list[list[str | None]], claim_id_col: int
+) -> list[list[str]]:
+    """用 ClaimID 列作为 logical row 锚点重建逻辑行。
+
+    核心难点：PDF 把 'D2' 切成 'D'+'2' 两行（甚至 'EV'+'1' 三行）这种很常见。
+    所以不能逐行判断「ClaimID 列是否匹配 _CLAIM_ID_RE」，而是要**跨行累积**字符
+    直到累积串匹配 _CLAIM_ID_RE 才开启一个新 logical row。
+
+    状态机：
+      - cid_buffer：跨行累积的 ClaimID 字符
+      - pending_rows：buffer 尚未匹配完整时的物理行列表（一旦 buffer 完整就归入新 logical row）
+      - groups：已成型的 logical rows
+    """
+    groups: list[list[list[str | None]]] = []
+    cid_buffer = ""
+    pending_rows: list[list[str | None]] = []
+
+    def commit_pending_to_last():
+        """buffer 走偏（太长且不匹配）时，把 pending 归到上一 logical row（视作续行）。"""
+        if pending_rows and groups:
+            groups[-1].extend(pending_rows)
+
+    for row in rows:
+        if not row:
+            continue
+        cid_cell = row[claim_id_col] if claim_id_col < len(row) else ""
+        cid_norm = _normalize_claim_id_cell(cid_cell)
+
+        if not cid_norm:
+            # ClaimID 列空：续行
+            if cid_buffer:
+                # 累积期间的续行先放 pending
+                pending_rows.append(list(row))
+            elif groups:
+                groups[-1].append(list(row))
+            # 顶部碎片丢弃
+            continue
+
+        # ClaimID 列非空：尝试加入 buffer
+        new_buffer = cid_buffer + cid_norm
+        if _CLAIM_ID_RE.match(new_buffer):
+            # buffer 完整：开启新 logical row，把 pending+当前行都归入
+            new_group = pending_rows + [list(row)]
+            groups.append(new_group)
+            cid_buffer = ""
+            pending_rows = []
+        elif len(new_buffer) <= 6 and re.match(r"^[A-Z]{1,3}\d{0,3}$", new_buffer):
+            # buffer 仍在合法累积过程中
+            cid_buffer = new_buffer
+            pending_rows.append(list(row))
+        else:
+            # buffer 走偏，重置
+            commit_pending_to_last()
+            pending_rows = []
+            cid_buffer = ""
+            # 当前行 cid_norm 重新作为累积起点
+            if _CLAIM_ID_RE.match(cid_norm):
+                groups.append([list(row)])
+            elif re.match(r"^[A-Z]{1,3}\d{0,3}$", cid_norm):
+                cid_buffer = cid_norm
+                pending_rows = [list(row)]
+            elif groups:
+                groups[-1].append(list(row))
+
+    # 收尾：未匹配完成的 pending 归到上一 logical row
+    commit_pending_to_last()
+
+    # 物理行 → 单个 logical row（同列非空值用空格连接）
+    result: list[list[str]] = []
+    for group in groups:
+        max_cols = max(len(r) for r in group)
+        merged_cells: list[str] = []
+        for col in range(max_cols):
+            parts = []
+            for r in group:
+                v = r[col] if col < len(r) else ""
+                v = (v or "").strip()
+                if v:
+                    parts.append(v)
+            merged_cells.append(" ".join(parts))
+        # ClaimID 列特殊处理：去除内部空白
+        if claim_id_col < len(merged_cells):
+            merged_cells[claim_id_col] = _normalize_claim_id_cell(merged_cells[claim_id_col])
+        result.append(merged_cells)
+    return result
+
+
+def _claim_id_table_to_claims(
+    doc_id: str,
+    table_idx: int,
+    rows: list[list[str | None]],
+    headers: list[str],
+    block: Block,
+    section_path: list[str],
+) -> list[Claim]:
+    """ClaimID 表抽取主路径。"""
+    claim_id_col = _detect_claim_id_column(headers, rows)
+    source_url_col = _detect_source_url_column(headers, rows)
+    logger.debug("claim_id_table: cid_col=%s url_col=%s n_rows=%s", claim_id_col, source_url_col, len(rows))
+    if claim_id_col is None or source_url_col is None:
+        return []
+
+    logical_rows = _merge_rows_by_claim_id(rows, claim_id_col)
+    if not logical_rows:
+        return []
+
+    n_cols = len(headers)
+    table_signature = "|".join(_clean(h) for h in headers)
+
+    claims: list[Claim] = []
+    for row_offset, row in enumerate(logical_rows, start=1):
+        # 取 ClaimID（容忍前缀污染：如 'T12ClaimID' 由后续表头并入产生）
+        cid_raw = row[claim_id_col] if claim_id_col < len(row) else ""
+        cid = _normalize_claim_id_cell(cid_raw)
+        if not _CLAIM_ID_RE.match(cid):
+            # 尝试贪心前缀匹配
+            prefix_match = re.match(r"^[A-Z]{1,3}\d{1,3}", cid)
+            if prefix_match:
+                cid = prefix_match.group(0)
+            else:
+                continue
+
+        # 取 URL：先尝试 source_url_col；若该列无 URL，扫整行所有列兜底
+        # （pdfplumber 跨行列对齐有时错位，URL 可能跑到隔壁列）
+        source_cell = row[source_url_col] if source_url_col < len(row) else ""
+        source_cell = (source_cell or "").strip()
+        urls = _extract_urls(source_cell)
+        url_source_col = source_url_col
+        if not urls:
+            for col_idx in range(len(row)):
+                if col_idx == claim_id_col:
+                    continue
+                cand = (row[col_idx] or "").strip()
+                found = _extract_urls(cand)
+                if found:
+                    source_cell = cand
+                    urls = found
+                    url_source_col = col_idx
+                    break
+        urls = [u.rstrip(").,;，。、 ") for u in urls]
+        urls = _dedupe_urls(urls)
+        if not urls:
+            # 没 URL 不抽（「信息缺口」表也会落到这里被跳过）
+            continue
+
+        # original_columns: 列名 → 单元格原值（含 URL 列）
+        original_columns: dict[str, str] = {}
+        for col_idx in range(min(n_cols, len(row))):
+            col_name = _clean(headers[col_idx]) or f"列{col_idx + 1}"
+            cell_val = (row[col_idx] or "").strip()
+            if col_idx == claim_id_col:
+                cell_val = cid  # 归一化后的 ClaimID
+            original_columns[col_name] = cell_val
+
+        # statement = 除 ClaimID 列和 来源列外，所有非空列按 "列名: 值；列名: 值" 拼接
+        statement_parts = []
+        for col_idx in range(min(n_cols, len(row))):
+            if col_idx in (claim_id_col, url_source_col):
+                continue
+            col_name = _clean(headers[col_idx])
+            val = (row[col_idx] or "").strip()
+            if not val:
+                continue
+            if col_name:
+                statement_parts.append(f"{col_name}：{val}")
+            else:
+                statement_parts.append(val)
+        statement = "；".join(statement_parts) or cid
+
+        # source_name 用 URL 域名兜底（reporter 显示用）
+        source_name_raw = source_cell or urls[0]
+
+        claims.append(
+            Claim(
+                claim_id=f"{doc_id}#{cid}",
+                section_path=list(section_path),
+                metric=None,
+                value=None,
+                year=None,
+                region=None,
+                statement=statement,
+                source_name_raw=source_name_raw,
+                source_url_hint=urls[0],
+                source_urls=urls,
+                extra_source_urls=urls[1:],
+                source_name_with_marks=source_cell or None,
+                publish_time=None,
+                notes=None,
+                is_forecast=False,
+                original_columns=original_columns,
+                original_claim_id=cid,
+                table_signature=table_signature,
+            )
+        )
+    return claims

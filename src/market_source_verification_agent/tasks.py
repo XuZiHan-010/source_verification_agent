@@ -13,6 +13,7 @@ import json
 import mimetypes
 import shutil
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
@@ -78,6 +79,7 @@ class LocalTaskStore:
         self.settings = settings or load_settings()
         self.root = _abs_path(self.settings.storage.reports_dir).parent / "runs"
         self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
 
     def create_run(
         self,
@@ -109,14 +111,21 @@ class LocalTaskStore:
         path = self._task_path(run_id)
         if not path.exists():
             return None
-        task = RunTask.model_validate_json(path.read_text(encoding="utf-8"))
+        data = _read_json_text(path)
+        if data is None:
+            return None
+        try:
+            task = RunTask.model_validate_json(data)
+        except Exception:
+            return None
         return task if task.owner_id == owner_id else None
 
     def save_task(self, task: RunTask) -> None:
         task.updated_at = datetime.now()
         run_dir = self._run_dir(task.run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
-        self._task_path(task.run_id).write_text(task.model_dump_json(indent=2), encoding="utf-8")
+        with self._lock:
+            _atomic_write_text(self._task_path(task.run_id), task.model_dump_json(indent=2))
 
     def add_event(
         self,
@@ -138,11 +147,10 @@ class LocalTaskStore:
             created_at=datetime.now(),
         )
         path = self._events_path(run_id)
-        events = []
-        if path.exists():
-            events = json.loads(path.read_text(encoding="utf-8"))
-        events.append(event.model_dump(mode="json"))
-        path.write_text(json.dumps(events, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._lock:
+            events = _read_json_list(path)
+            events.append(event.model_dump(mode="json"))
+            _atomic_write_text(path, json.dumps(events, ensure_ascii=False, indent=2))
         return event
 
     def list_events(self, run_id: str, owner_id: str) -> list[RunEvent]:
@@ -151,16 +159,15 @@ class LocalTaskStore:
         path = self._events_path(run_id)
         if not path.exists():
             return []
-        return [RunEvent.model_validate(item) for item in json.loads(path.read_text(encoding="utf-8"))]
+        return [RunEvent.model_validate(item) for item in _read_json_list(path)]
 
     def save_artifact(self, artifact: Artifact) -> None:
         path = self._artifacts_path(artifact.run_id)
-        artifacts = []
-        if path.exists():
-            artifacts = json.loads(path.read_text(encoding="utf-8"))
-        artifacts = [item for item in artifacts if item.get("artifact_id") != artifact.artifact_id]
-        artifacts.append(artifact.model_dump(mode="json"))
-        path.write_text(json.dumps(artifacts, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._lock:
+            artifacts = _read_json_list(path)
+            artifacts = [item for item in artifacts if item.get("artifact_id") != artifact.artifact_id]
+            artifacts.append(artifact.model_dump(mode="json"))
+            _atomic_write_text(path, json.dumps(artifacts, ensure_ascii=False, indent=2))
 
     def list_artifacts(self, run_id: str, owner_id: str) -> list[Artifact]:
         if not self.get_task(run_id, owner_id):
@@ -168,7 +175,7 @@ class LocalTaskStore:
         path = self._artifacts_path(run_id)
         if not path.exists():
             return []
-        return [Artifact.model_validate(item) for item in json.loads(path.read_text(encoding="utf-8"))]
+        return [Artifact.model_validate(item) for item in _read_json_list(path)]
 
     def list_runs(self, owner_id: str, limit: int = 20, offset: int = 0) -> list[RunTask]:
         tasks = []
@@ -179,7 +186,10 @@ class LocalTaskStore:
             if not task_path.exists():
                 continue
             try:
-                task = RunTask.model_validate_json(task_path.read_text(encoding="utf-8"))
+                data = _read_json_text(task_path)
+                if data is None:
+                    continue
+                task = RunTask.model_validate_json(data)
                 if task.owner_id == owner_id:
                     tasks.append(task)
             except Exception:
@@ -220,6 +230,37 @@ class LocalTaskStore:
         reports_dir = _abs_path(self.settings.storage.reports_dir) / run_id
         shutil.rmtree(uploads_dir, ignore_errors=True)
         shutil.rmtree(reports_dir, ignore_errors=True)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _read_json_text(path: Path, attempts: int = 3) -> str | None:
+    for attempt in range(attempts):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if text.strip():
+            return text
+        if attempt < attempts - 1:
+            time.sleep(0.02)
+    return None
+
+
+def _read_json_list(path: Path) -> list[dict]:
+    text = _read_json_text(path)
+    if text is None:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
 
 
 def create_text_input(run_id: str, text: str, settings: Settings) -> Path:
@@ -290,6 +331,14 @@ def execute_run(run_id: str, owner_id: str, store: TaskStore | None = None) -> R
 
         artifact = artifact_from_file(output_path, task.run_id, task.owner_id, task.requested_format)
         store.save_artifact(artifact)
+        artifacts = [artifact]
+
+        for extra_fmt in _extra_output_formats(task.requested_format):
+            extra_path = output_dir / f"result.{extra_fmt}"
+            if _write_extra_artifact(output_path, extra_path, task.requested_format, extra_fmt):
+                extra_artifact = artifact_from_file(extra_path, task.run_id, task.owner_id, extra_fmt)
+                store.save_artifact(extra_artifact)
+                artifacts.append(extra_artifact)
 
         task.status = "completed"
         task.current_stage = "completed"
@@ -303,7 +352,7 @@ def execute_run(run_id: str, owner_id: str, store: TaskStore | None = None) -> R
         }
         task.total_claims = int(report.summary.get("total", 0) or 0)
         task.completed_claims = task.total_claims
-        task.artifact_ids = [artifact.artifact_id]
+        task.artifact_ids = [item.artifact_id for item in artifacts]
         store.save_task(task)
         store.add_event(run_id, "completed", "info", "Run completed", task.completed_claims, task.total_claims)
         return task
@@ -334,6 +383,61 @@ def artifact_from_file(path: Path, run_id: str, owner_id: str, fmt: str) -> Arti
         sha256=hashlib.sha256(body).hexdigest(),
         created_at=datetime.now(),
     )
+
+
+def _extra_output_formats(requested_format: str) -> list[str]:
+    if requested_format == "json":
+        return ["xlsx"]
+    return []
+
+
+def _write_extra_artifact(source_path: Path, target_path: Path, source_fmt: str, target_fmt: str) -> bool:
+    if source_fmt == "json" and target_fmt == "xlsx":
+        _write_xlsx_from_json_report(source_path, target_path)
+        return True
+    return False
+
+
+def _write_xlsx_from_json_report(source_path: Path, target_path: Path) -> None:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError("xlsx output requires openpyxl") from exc
+
+    data = json.loads(source_path.read_text(encoding="utf-8"))
+    sections = data if isinstance(data, list) else []
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "source_verification"
+
+    if sections and all(isinstance(item, dict) and "rows" in item for item in sections):
+        for section in sections:
+            title = str(section.get("title") or "sub-table")
+            headers = list(section.get("headers") or [])
+            rows = list(section.get("rows") or [])
+            ws.append([title])
+            ws.cell(row=ws.max_row, column=1).font = Font(bold=True, size=12)
+            ws.append(headers)
+            for cell in ws[ws.max_row]:
+                cell.font = Font(bold=True)
+            for row in rows:
+                ws.append([row.get(header, "") if isinstance(row, dict) else "" for header in headers])
+            ws.append([])
+    else:
+        rows = sections
+        headers = list(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        for row in rows:
+            ws.append([row.get(header, "") if isinstance(row, dict) else "" for header in headers])
+
+    for col_idx in range(1, ws.max_column + 1):
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 24
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(target_path)
 
 
 def path_from_storage_uri(storage_uri: str) -> Path:

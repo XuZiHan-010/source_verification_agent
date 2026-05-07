@@ -43,6 +43,9 @@ class Claim(BaseModel):
     is_forecast: bool = False
     duplicate_count: int = 1
     duplicate_claim_ids: list[str] = Field(default_factory=list)
+    original_columns: dict[str, str] | None = None
+    original_claim_id: str | None = None
+    table_signature: str | None = None
 
 
 class ResolvedSource(BaseModel):

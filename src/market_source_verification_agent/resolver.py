@@ -147,7 +147,7 @@ def resolve(claim: Claim, settings: Settings | None = None, source_tiers: dict |
 
 # ── Fetch with retry + archive.org mirror ────────────────────────────────────
 
-def _fetch_and_cache(url: str, settings: Settings) -> dict[str, str | None]:
+def _fetch_and_cache_legacy(url: str, settings: Settings) -> dict[str, str | None]:
     cache_dir = _abs_path(settings.cache.dir) / "sources"
     cache_dir.mkdir(parents=True, exist_ok=True)
     url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()
@@ -193,7 +193,7 @@ def _fetch_and_cache(url: str, settings: Settings) -> dict[str, str | None]:
     return meta
 
 
-def _persist(body: bytes, content_type_header: str, cache_path: Path, suffix: str, meta: dict) -> dict | None:
+def _persist_legacy(body: bytes, content_type_header: str, cache_path: Path, suffix: str, meta: dict) -> dict | None:
     # Defensive guard: never write 0-byte (or near-empty) files. Callers treat
     # None as "fetch produced nothing usable" and fall back to empty_body.
     min_bytes = _MIN_PDF_BYTES if suffix == ".pdf" else _MIN_HTML_BYTES
@@ -209,6 +209,97 @@ def _persist(body: bytes, content_type_header: str, cache_path: Path, suffix: st
         except Exception:
             meta["title"] = None
     return meta
+
+
+def _fetch_and_cache(url: str, settings: Settings) -> dict[str, str | None]:
+    cache_dir = _abs_path(settings.cache.dir) / "sources"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    expected_suffix = ".pdf" if _url_looks_like_pdf(url) else ".html"
+    cache_path = cache_dir / f"{url_hash}{expected_suffix}"
+    meta = {
+        "status": "ok",
+        "path": str(cache_path),
+        "content_type": "pdf" if expected_suffix == ".pdf" else "html",
+        "hash": None,
+        "title": None,
+    }
+
+    min_bytes = _MIN_PDF_BYTES if expected_suffix == ".pdf" else _MIN_HTML_BYTES
+
+    for candidate in _cache_candidates(cache_dir, url_hash, expected_suffix):
+        if not candidate.exists():
+            continue
+        body = candidate.read_bytes()
+        content_type = _sniff_content_type(body, "", candidate.suffix)
+        candidate_min_bytes = _MIN_PDF_BYTES if content_type == "pdf" else _MIN_HTML_BYTES
+        if len(body) >= candidate_min_bytes:
+            meta["path"] = str(candidate)
+            meta["content_type"] = content_type
+            meta["hash"] = hashlib.sha256(body).hexdigest()
+            meta["title"] = None if content_type == "pdf" else _extract_title(body.decode("utf-8", errors="ignore"))
+            return meta
+        try:
+            candidate.unlink()
+        except OSError:
+            pass
+
+    direct = _http_get_with_retry(url, min_body_bytes=min_bytes)
+    if direct["status"] == "ok":
+        persisted = _persist(direct["body"], direct["content_type_header"], cache_path, meta)
+        if persisted is not None:
+            return persisted
+        direct = {**direct, "status": "empty_body"}
+
+    if expected_suffix == ".html" and direct["status"] in {"forbidden", "timeout", "server_error", "empty_body"}:
+        archived = _http_get_with_retry(_archive_url(url), max_attempts=2, min_body_bytes=min_bytes)
+        if archived["status"] == "ok":
+            persisted = _persist(archived["body"], archived["content_type_header"], cache_path, meta)
+            if persisted is not None:
+                persisted["mirror"] = "archive.org"
+                return persisted
+
+    status = direct["status"]
+    if status == "server_error":
+        status = "forbidden"
+    meta["status"] = status
+    meta["path"] = None
+    return meta
+
+
+def _persist(body: bytes, content_type_header: str, cache_path: Path, meta: dict) -> dict | None:
+    content_type = _sniff_content_type(body, content_type_header, cache_path.suffix)
+    min_bytes = _MIN_PDF_BYTES if content_type == "pdf" else _MIN_HTML_BYTES
+    if not body or len(body) < min_bytes:
+        return None
+    final_path = cache_path.with_suffix(".pdf" if content_type == "pdf" else ".html")
+    final_path.write_bytes(body)
+    meta["path"] = str(final_path)
+    meta["content_type"] = content_type
+    meta["hash"] = hashlib.sha256(body).hexdigest()
+    meta["title"] = None
+    if content_type != "pdf":
+        try:
+            meta["title"] = _extract_title(body.decode("utf-8", errors="ignore"))
+        except Exception:
+            meta["title"] = None
+    return meta
+
+
+def _url_looks_like_pdf(url: str) -> bool:
+    return urlparse(url).path.lower().endswith(".pdf")
+
+
+def _cache_candidates(cache_dir: Path, url_hash: str, preferred_suffix: str) -> list[Path]:
+    alternate = ".pdf" if preferred_suffix == ".html" else ".html"
+    return [cache_dir / f"{url_hash}{preferred_suffix}", cache_dir / f"{url_hash}{alternate}"]
+
+
+def _sniff_content_type(body: bytes, content_type_header: str, suffix: str) -> str:
+    header = (content_type_header or "").lower()
+    if "pdf" in header or body.startswith(b"%PDF") or suffix == ".pdf":
+        return "pdf"
+    return "html"
 
 
 def _http_get_with_retry(url: str, max_attempts: int = 3, min_body_bytes: int = 1) -> dict:
@@ -533,12 +624,36 @@ def _prune_html_for_llm(html: str) -> str:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _normalise_url(value: str | None) -> str | None:
+def _normalise_url_legacy(value: str | None) -> str | None:
     if not value:
         return None
     text = value.strip()
     if text.startswith(("http://", "https://")):
         return text
+    domain = _extract_domain(text)
+    return f"https://{domain}" if domain else None
+
+
+def _normalise_url_legacy2(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.strip().strip("<>").strip(" \t\r\n).,;，。、")
+    if text.startswith(("http://", "https://")):
+        text = re.sub(r"[\r\n\t\f\v]+", "", text)
+        text = re.sub(r"(?<=\S) (?=[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{1,4}(?:\s|$))", "", text)
+        return text.strip(" \t\r\n).,;，。、") or None
+    domain = _extract_domain(text)
+    return f"https://{domain}" if domain else None
+
+
+def _normalise_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.strip().strip("<>").strip(" \t\r\n).,;")
+    if text.startswith(("http://", "https://")):
+        text = re.sub(r"[\r\n\t\f\v]+", "", text)
+        text = re.sub(r"(?<=\S) (?=[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*(?:\d|[/.?&=#%_-]))", "", text)
+        return text.strip(" \t\r\n).,;") or None
     domain = _extract_domain(text)
     return f"https://{domain}" if domain else None
 
