@@ -50,7 +50,7 @@ auth:
   require_auth:         true
 
 runtime:
-  task_store_backend:   auto          # auto | local | mongodb
+  task_store_backend:   mongodb       # auto | local | mongodb
 
 web:
   host:               0.0.0.0
