@@ -1,7 +1,7 @@
 import pytest
 
 from market_source_verification_agent import classifier, extractor, ingestor, reporter
-from market_source_verification_agent.schema import Claim, ClassifyResult, ResolvedSource, VerifyResult
+from market_source_verification_agent.schema import Block, Claim, ClassifyResult, IR, ResolvedSource, VerifyResult
 
 
 def test_markdown_table_pipeline_renders_json():
@@ -63,6 +63,31 @@ def test_classifier_matches_government_suffix():
     result = classifier.classify(source, claim)
 
     assert result.tier == "A"
+
+
+def test_claim_id_continuation_skips_leading_url_fragments():
+    first_table = Block(
+        type="table",
+        page=1,
+        rows=[
+            ["Claim ID", "Type", "Section", "Claim text", "URL source"],
+            ["C008", "row P2", "1.2", "previous row", "https://example.com/c008"],
+        ],
+    )
+    continuation = Block(
+        type="table",
+        page=2,
+        rows=[
+            ["", "", "", "", "wrapped/url/fragment.html"],
+            ["C009", "row P3", "1.2", "first continued row", "https://example.com/c009"],
+            ["C010", "paragraph P3", "1.3", "second continued row", "https://example.com/c010"],
+        ],
+    )
+    ir = IR(doc_id="test", source_format="pdf", blocks=[first_table, continuation])
+
+    claims = extractor.extract_claims(ir)
+
+    assert [claim.original_claim_id for claim in claims] == ["C008", "C009", "C010"]
 
 
 def test_classifier_matches_government_apex_suffix():

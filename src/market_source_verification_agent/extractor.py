@@ -156,14 +156,10 @@ def _table_to_claims(
         return [], inherited_claim_id_headers
 
     # 续表检测：当前 block 的 row 0 第 0 列已经是 ClaimID 数据 → 它没自己的 header，沿用上一个 ClaimID 表的 header
-    first_cell_norm = _normalize_claim_id_cell(rows[0][0]) if rows[0] else ""
-    is_continuation_data = (
-        bool(_CLAIM_ID_RE.match(first_cell_norm))
-        and inherited_claim_id_headers is not None
-    )
-    if is_continuation_data:
+    continuation_start = _claim_id_continuation_start(rows) if inherited_claim_id_headers is not None else None
+    if continuation_start is not None:
         headers = list(inherited_claim_id_headers)
-        data_rows_raw = rows
+        data_rows_raw = rows[continuation_start:]
     else:
         if len(rows) < 2:
             return [], inherited_claim_id_headers
@@ -1556,6 +1552,22 @@ def _normalize_claim_id_cell(cell: str | None) -> str:
     if not cell:
         return ""
     return re.sub(r"\s+", "", cell)
+
+
+def _claim_id_continuation_start(rows: list[list[str | None]]) -> int | None:
+    """Find the first data row in a continued ClaimID table.
+
+    PDF table extraction often leaves URL fragments from the previous page before
+    the first real row. When headers are inherited, those fragments should not
+    trigger header detection for the current block.
+    """
+    for idx, row in enumerate(rows[:8]):
+        if not row:
+            continue
+        first_cell_norm = _normalize_claim_id_cell(row[0])
+        if _CLAIM_ID_RE.match(first_cell_norm):
+            return idx
+    return None
 
 
 def _detect_claim_id_column(headers: list[str], data_rows: list[list[str | None]]) -> int | None:
