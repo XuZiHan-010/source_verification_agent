@@ -37,7 +37,8 @@ def main() -> int:
     url = redis_url(settings)
     if not url:
         raise RuntimeError(f"Missing Redis URL env var: {settings.queue.redis_url_env}")
-    connection = Redis.from_url(url)
+    ssl_kwargs = {"ssl_cert_reqs": None} if url.startswith("rediss://") else {}
+    connection = Redis.from_url(url, **ssl_kwargs)
     worker = Worker([settings.queue.default_queue], connection=connection)
     worker.work(with_scheduler=False)
     return 0

@@ -21,7 +21,8 @@ def enqueue_run(run_id: str, owner_id: str, settings: Settings | None = None) ->
         return False
 
     try:
-        connection = Redis.from_url(redis_url)
+        ssl_kwargs = {"ssl_cert_reqs": None} if redis_url.startswith("rediss://") else {}
+        connection = Redis.from_url(redis_url, **ssl_kwargs)
         connection.ping()
         queue = Queue(settings.queue.default_queue, connection=connection)
         queue.enqueue(
